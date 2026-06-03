@@ -77,126 +77,254 @@ class SecretManager(ABC):
         """Return a Kubernetes EnvVarSource for a personal access token"""
         pass
 
+    @abstractmethod
+    def getCaCertBundle(self, credential_name: str) -> Union[k8s.V1EnvVarSource, str]:
+        """Return env-var source (or string) for the CA bundle.
+        Reads from the secret store under the key 'CA_CERT'."""
+        ...
+
+    def getCredential(self, credential_name: str, credential_type: str) -> List[k8s.V1EnvVar]:
+        """Return env vars needed to expose the named credential of the given type
+        to a job pod. Dispatches per credential_type, calling the per-type getters
+        and shaping their returns into env vars."""
+        if credential_type == 'USER_PASSWORD':
+            user, password = self.getUserPassword(credential_name)
+            return [
+                SecretManager.to_envvar(f"{credential_name}_USER", user),
+                SecretManager.to_envvar(f"{credential_name}_PASSWORD", password),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='USER_PASSWORD'),
+            ]
+        if credential_type == 'API_KEY_PAIR':
+            api_key, api_secret = self.getApiKey(credential_name)
+            return [
+                SecretManager.to_envvar(f"{credential_name}_API_KEY", api_key),
+                SecretManager.to_envvar(f"{credential_name}_API_SECRET", api_secret),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='API_KEY_PAIR'),
+            ]
+        if credential_type == 'API_TOKEN':
+            token = self.getPATSecret(credential_name)
+            return [
+                SecretManager.to_envvar(f"{credential_name}_TOKEN", token),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='API_TOKEN'),
+            ]
+        if credential_type == 'PRIVATE_KEY_AUTH':
+            user, private_key, passphrase = self.getPrivateKeyAuth(credential_name)
+            return [
+                SecretManager.to_envvar(f"{credential_name}_USER", user),
+                SecretManager.to_envvar(f"{credential_name}_PRIVATE_KEY", private_key),
+                SecretManager.to_envvar(f"{credential_name}_PASSPHRASE", passphrase),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='PRIVATE_KEY_AUTH'),
+            ]
+        if credential_type == 'MTLS_CERT_WITH_KEY':
+            public_cert, private_key, passphrase = self.getMtlsCertWithKey(credential_name)
+            return [
+                SecretManager.to_envvar(f"{credential_name}_PUBLIC_CERT", public_cert),
+                SecretManager.to_envvar(f"{credential_name}_PRIVATE_KEY", private_key),
+                SecretManager.to_envvar(f"{credential_name}_PASSPHRASE", passphrase),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='MTLS_CERT_WITH_KEY'),
+            ]
+        if credential_type == 'CA_CERT_BUNDLE':
+            ca_cert = self.getCaCertBundle(credential_name)
+            return [
+                SecretManager.to_envvar(f"{credential_name}_CA_CERT", ca_cert),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='CA_CERT_BUNDLE'),
+            ]
+        raise ValueError(f"Unsupported credential type '{credential_type}' for credential '{credential_name}'")
+
     @staticmethod
     def to_envvar(name: str, val: Union[str, k8s.V1EnvVarSource]) -> k8s.V1EnvVar:
         return k8s.V1EnvVar(name=name, value=val) if isinstance(val, str) else k8s.V1EnvVar(name=name, value_from=val)
 
-# Airflow Azure Key Vault Secrets Manager Integration
-# This version reads secrets directly from Azure Key Vault.
+# Airflow 3.x Kubernetes Secret Manager
+# This version reads secrets directly from the Kubernetes API,
+# which is necessary because Airflow 3.x's SDK task runner runs in a subprocess
+# that doesn't inherit environment variables from the pod.
 #
-# Secret organization in Azure Key Vault:
-# datasurface--{namespace}--{ecosystem_name}--{credential_name}--{key}
-# (Azure Key Vault names cannot contain slashes, so we use double-dash separators)
-#
-# Azure configuration required:
-# - AZURE_KEY_VAULT_URL environment variable (e.g., https://<vault-name>.vault.azure.net)
-# - Azure Workload Identity or Managed Identity configured for the pod
+# RBAC permissions required:
+# - The Airflow service account must have 'get' permission on secrets in the namespace
 
-import json
-import os
-import re
-from typing import Dict, Optional, Tuple
-from azure.identity import DefaultAzureCredential
-from azure.keyvault.secrets import SecretClient
+import base64
+from typing import Dict, List, Optional, Set, Tuple, Union
+from kubernetes import client, config
+from kubernetes.client import models as k8s
 
 
-class AzureKeyVaultSecretManager(SecretManager):
-
-    def __init__(self, namespace: str, ecosystem_name: str):
+class K8sSecretManager(SecretManager):
+    """
+    Kubernetes Secret Manager that reads secrets directly from the Kubernetes API.
+    
+    This allows DAG code running inside Airflow (scheduler, workers) to access
+    the namespace-local Kubernetes Secrets created directly or by ESO.
+    
+    The Airflow service account must have RBAC permissions to read secrets in the namespace.
+    """
+    
+    def __init__(self, namespace: str):
         super().__init__()
         self.namespace = namespace
-        self.ecosystem_name = ecosystem_name
-        # Expect AZURE_KEY_VAULT_URL in environment (e.g., https://<vault-name>.vault.azure.net)
-        vault_url = os.environ.get('AZURE_KEY_VAULT_URL')
-        if not vault_url:
-            raise Exception("AZURE_KEY_VAULT_URL environment variable is required for secret access")
-        self._client: Optional[SecretClient] = None
-        self._vault_url = vault_url
-
+        self._api: Optional[client.CoreV1Api] = None
+        self._secret_key_cache: Dict[str, Set[str]] = {}
+    
     @property
-    def client(self) -> SecretClient:
-        """Lazily initialize the Azure Key Vault client."""
-        if self._client is None:
-            self._client = SecretClient(vault_url=self._vault_url, credential=DefaultAzureCredential())
-        return self._client
-
-    def _build_secret_base(self, credential_name: str) -> str:
-        """Build the base Azure Key Vault secret name for a credential.
-
-        Path format: datasurface--{namespace}--{ecosystem_name}--{credential_name}
-        (Azure Key Vault names cannot contain slashes, so we use double-dash separators)
-
-        Note: credential_name is already preprocessed by K8sUtils.to_k8s_name()
-        before being stored in DAG tables, so no additional processing needed.
-        """
-        return f"datasurface--{self.namespace}--{self.ecosystem_name}--{credential_name}"
-
-    def isNameAllowed(self, credential_name: str) -> bool:
-        """
-        Validate secret name for Azure Key Vault compatibility.
-        Azure Key Vault secret names: 1-127 chars, alphanumerics and -, not starting/ending with -.
-        """
-        if not credential_name or len(credential_name) < 1 or len(credential_name) > 127:
-            return False
-        if not re.match(r'^[A-Za-z0-9-]+$', credential_name):
-            return False
-        if credential_name.startswith('-') or credential_name.endswith('-'):
-            return False
-        return True
-
-    def generateLegalName(self, credential_name: str) -> str:
-        if not credential_name:
-            return "default-secret"
-        name = re.sub(r'[^A-Za-z0-9-]', '-', credential_name)
-        name = re.sub(r'-+', '-', name).strip('-')
-        if not name:
-            name = "default-secret"
-        if len(name) > 120:
-            name = name[:120].rstrip('-')
-        return name
-
-    def _try_get_secret_value(self, name: str) -> Optional[str]:
-        try:
-            return self.client.get_secret(name).value
-        except Exception:
-            return None
-
-    def _read_secret(self, credential_name: str) -> Dict[str, str]:
-        """Read a secret from Azure Key Vault and return parsed data.
-
-        Tries two strategies:
-        1. Single JSON secret: {base}--credentials containing all key-value pairs
-        2. Individual secrets: {base}--{key} for each expected key
-        """
-        base = self._build_secret_base(credential_name)
-
-        # Strategy 1: single JSON secret "{base}--credentials"
-        json_name = f"{base}--credentials"
-        sv = self._try_get_secret_value(json_name)
-        if sv:
+    def api(self) -> client.CoreV1Api:
+        """Lazily initialize the Kubernetes API client."""
+        if self._api is None:
             try:
-                return json.loads(sv)
-            except Exception:
-                pass
+                # Try in-cluster config first (when running inside Kubernetes)
+                config.load_incluster_config()
+            except config.ConfigException:
+                # Fall back to kubeconfig for local development
+                config.load_kube_config()
+            self._api = client.CoreV1Api()
+        return self._api
+    
+    def _normalize_secret_name(self, name: str) -> str:
+        """Normalize credential name to valid K8s secret name (RFC 1123).
+        
+        Must match K8sUtils.to_k8s_name() logic exactly:
+        1. Convert to lowercase
+        2. Replace underscores with hyphens
+        3. Replace spaces with hyphens  
+        4. Remove non-alphanumeric characters (except hyphens)
+        5. Collapse multiple consecutive hyphens
+        6. Strip leading/trailing hyphens
+        """
+        import re
+        name = name.lower().replace('_', '-').replace(' ', '-')
+        name = re.sub(r'[^a-z0-9-]', '', name)
+        name = re.sub(r'-+', '-', name)
+        name = name.strip('-')
+        return name
+    
+    def _read_secret_object(self, secret_name: str) -> k8s.V1Secret:
+        """Read a secret from Kubernetes."""
+        # Normalize the secret name for K8s (underscores not allowed)
+        k8s_secret_name = self._normalize_secret_name(secret_name)
+        try:
+            return self.api.read_namespaced_secret(name=k8s_secret_name, namespace=self.namespace)
+        except client.ApiException as e:
+            if e.status == 404:
+                raise Exception(f"Secret '{secret_name}' not found in namespace '{self.namespace}'")
+            raise Exception(f"Failed to read secret '{secret_name}': {e.reason}")
 
-        # Strategy 2: individual secrets
-        creds: Dict[str, str] = {}
-        for key in ['USER', 'PASSWORD', 'token', 'TOKEN', 'api_key', 'api_secret',
-                     'API_KEY', 'API_SECRET', 'PRIVATE_KEY', 'private_key', 'PASSPHRASE', 'passphrase']:
-            val = self._try_get_secret_value(f"{base}--{key}")
-            if val is not None:
-                creds[key] = val
-        return creds
+    def _read_secret(self, secret_name: str) -> Dict[str, str]:
+        """Read a secret from Kubernetes and return decoded data."""
+        secret = self._read_secret_object(secret_name)
+        if secret.data is None:
+            return {}
+        # Decode base64-encoded secret data
+        return {k: base64.b64decode(v).decode('utf-8') for k, v in secret.data.items()}
+
+    def _read_secret_keys(self, secret_name: str) -> Set[str]:
+        """Read a secret from Kubernetes and return only its key names."""
+        if secret_name in self._secret_key_cache:
+            return self._secret_key_cache[secret_name]
+        secret = self._read_secret_object(secret_name)
+        keys = set((secret.data or {}).keys())
+        self._secret_key_cache[secret_name] = keys
+        return keys
+
+    def _secret_key_env_source(
+        self,
+        credential_name: str,
+        *keys: str,
+        optional: bool = False,
+    ) -> Union[k8s.V1EnvVarSource, str]:
+        """Return an EnvVarSource pointing at an existing secret key.
+
+        This keeps plaintext values out of the created pod spec. Airflow still
+        needs permission to read secrets for scheduler-side work, but job pods
+        receive Kubernetes secret references instead of brokered literal values.
+        """
+        present_keys = self._read_secret_keys(credential_name)
+        selected_key = next((key for key in keys if key in present_keys), None)
+        if selected_key is None:
+            if optional:
+                return ""
+            raise Exception(f"Secret '{credential_name}' missing required key(s): {', '.join(keys)}")
+        return k8s.V1EnvVarSource(
+            secret_key_ref=k8s.V1SecretKeySelector(
+                name=self._normalize_secret_name(credential_name),
+                key=selected_key,
+                optional=optional,
+            )
+        )
+
+    def _credential_env_var(
+        self,
+        credential_name: str,
+        suffix: str,
+        *keys: str,
+        optional: bool = False,
+    ) -> k8s.V1EnvVar:
+        source = self._secret_key_env_source(credential_name, *keys, optional=optional)
+        return SecretManager.to_envvar(f"{credential_name}_{suffix}", source)
+
+    def getCredential(self, credential_name: str, credential_type: str) -> List[k8s.V1EnvVar]:
+        """Return env vars that reference Kubernetes Secrets instead of copying values.
+
+        The inherited implementation is still appropriate for external vault
+        backends, where Kubernetes cannot natively dereference the provider.
+        For the Kubernetes backend, use secretKeyRef so users with pod-read
+        access see only secret references, not plaintext credentials.
+        """
+        if credential_type == 'USER_PASSWORD':
+            return [
+                self._credential_env_var(credential_name, 'USER', 'USER', 'user'),
+                self._credential_env_var(credential_name, 'PASSWORD', 'PASSWORD', 'password'),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='USER_PASSWORD'),
+            ]
+        if credential_type == 'API_KEY_PAIR':
+            return [
+                self._credential_env_var(credential_name, 'API_KEY', 'API_KEY', 'api_key'),
+                self._credential_env_var(credential_name, 'API_SECRET', 'API_SECRET', 'api_secret'),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='API_KEY_PAIR'),
+            ]
+        if credential_type == 'API_TOKEN':
+            return [
+                self._credential_env_var(credential_name, 'TOKEN', 'token', 'TOKEN'),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='API_TOKEN'),
+            ]
+        if credential_type == 'PRIVATE_KEY_AUTH':
+            return [
+                self._credential_env_var(credential_name, 'USER', 'USER', 'user'),
+                self._credential_env_var(credential_name, 'PRIVATE_KEY', 'PRIVATE_KEY', 'private_key'),
+                self._credential_env_var(
+                    credential_name,
+                    'PASSPHRASE',
+                    'PASSPHRASE',
+                    'passphrase',
+                    optional=True,
+                ),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='PRIVATE_KEY_AUTH'),
+            ]
+        if credential_type == 'MTLS_CERT_WITH_KEY':
+            return [
+                self._credential_env_var(credential_name, 'PUBLIC_CERT', 'PUBLIC_CERT', 'public_cert'),
+                self._credential_env_var(credential_name, 'PRIVATE_KEY', 'PRIVATE_KEY', 'private_key'),
+                self._credential_env_var(
+                    credential_name,
+                    'PASSPHRASE',
+                    'PASSPHRASE',
+                    'passphrase',
+                    optional=True,
+                ),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='MTLS_CERT_WITH_KEY'),
+            ]
+        if credential_type == 'CA_CERT_BUNDLE':
+            return [
+                self._credential_env_var(credential_name, 'CA_CERT', 'CA_CERT', 'ca_cert'),
+                k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='CA_CERT_BUNDLE'),
+            ]
+        raise ValueError(f"Unsupported credential type '{credential_type}' for credential '{credential_name}'")
 
     def getUserPassword(self, credential_name: str) -> Tuple[str, str]:
         """
-        Read USER and PASSWORD from an Azure Key Vault secret.
+        Read USER and PASSWORD from a Kubernetes secret.
 
-        Expected secret JSON format:
-        {
-            "USER": "username",
-            "PASSWORD": "password"
-        }
+        Expected secret format:
+        - Key: USER -> value: username
+        - Key: PASSWORD -> value: password
 
         Also accepts lowercase keys (user, password) for flexibility.
         """
@@ -211,12 +339,10 @@ class AzureKeyVaultSecretManager(SecretManager):
 
     def getPATSecret(self, credential_name: str) -> str:
         """
-        Read a Personal Access Token from an Azure Key Vault secret.
+        Read a Personal Access Token from a Kubernetes secret.
 
-        Expected secret JSON format:
-        {
-            "token": "the-pat-token"
-        }
+        Expected secret format:
+        - Key: token -> value: the PAT
 
         Also accepts uppercase (TOKEN) for flexibility.
         """
@@ -230,13 +356,11 @@ class AzureKeyVaultSecretManager(SecretManager):
 
     def getApiKey(self, credential_name: str) -> Tuple[str, str]:
         """
-        Read API key and secret from an Azure Key Vault secret.
+        Read API key and secret from a Kubernetes secret.
 
-        Expected secret JSON format:
-        {
-            "api_key": "the-api-key",
-            "api_secret": "the-api-secret"
-        }
+        Expected secret format:
+        - Key: api_key -> value: the API key
+        - Key: api_secret -> value: the API secret
 
         Also accepts uppercase (API_KEY, API_SECRET) for flexibility.
         """
@@ -251,15 +375,13 @@ class AzureKeyVaultSecretManager(SecretManager):
 
     def getPrivateKeyAuth(self, credential_name: str) -> Tuple[str, str, str]:
         """
-        Read username, private key, and passphrase from an Azure Key Vault secret.
+        Read username, private key, and passphrase from a Kubernetes secret.
         Used for key-pair authentication (e.g., Snowflake).
 
         Expected secret format:
-        {
-            "USER": "username",
-            "PRIVATE_KEY": "PEM-encoded private key content",
-            "PASSPHRASE": "passphrase for encrypted private key (can be empty)"
-        }
+        - Key: USER -> value: username
+        - Key: PRIVATE_KEY -> value: PEM-encoded private key content
+        - Key: PASSPHRASE -> value: passphrase for encrypted private key (can be empty)
 
         Also accepts lowercase keys for flexibility.
         """
@@ -273,46 +395,46 @@ class AzureKeyVaultSecretManager(SecretManager):
 
         return user, private_key, passphrase
 
+    def getMtlsCertWithKey(self, credential_name: str) -> Tuple[str, str, str]:
+        """
+        Read public certificate, private key, and passphrase from a Kubernetes secret.
+        Used for mutual TLS (mTLS) authentication.
 
-secret_manager = AzureKeyVaultSecretManager(namespace='ds-nightly', ecosystem_name='Demo')
+        Expected secret format:
+        - Key: PUBLIC_CERT -> value: PEM-encoded public certificate content
+        - Key: PRIVATE_KEY -> value: PEM-encoded private key content
+        - Key: PASSPHRASE -> value: passphrase for encrypted private key (can be empty)
 
-# Helper: build env vars for a credential given its type
-def build_env_vars_for_credential(credential_name: str, credential_type: str) -> List[k8s.V1EnvVar]:
-    """Return Kubernetes env vars for the given credential and type.
-    Supports: USER_PASSWORD, API_KEY_PAIR, API_TOKEN, CLIENT_CERT_WITH_KEY.
-    """
-    if credential_type == 'USER_PASSWORD':
-        user, password = secret_manager.getUserPassword(credential_name)
-        envs = [
-            SecretManager.to_envvar(f"{credential_name}_USER", user),
-            SecretManager.to_envvar(f"{credential_name}_PASSWORD", password)
-        ]
-        envs.append(k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='USER_PASSWORD'))
-        return envs
-    if credential_type == 'API_KEY_PAIR':
-        api_key, api_secret = secret_manager.getApiKey(credential_name)
-        envs = [
-            SecretManager.to_envvar(f"{credential_name}_API_KEY", api_key),
-            SecretManager.to_envvar(f"{credential_name}_API_SECRET", api_secret)
-        ]
-        envs.append(k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='API_KEY_PAIR'))
-        return envs
-    if credential_type == 'API_TOKEN':
-        token = secret_manager.getPATSecret(credential_name)
-        envs = [SecretManager.to_envvar(f"{credential_name}_TOKEN", token)]
-        envs.append(k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='API_TOKEN'))
-        return envs
-    if credential_type == 'CLIENT_CERT_WITH_KEY':
-        user, private_key, passphrase = secret_manager.getPrivateKeyAuth(credential_name)
-        envs = [
-            SecretManager.to_envvar(f"{credential_name}_USER", user),
-            SecretManager.to_envvar(f"{credential_name}_PRIVATE_KEY", private_key),
-            SecretManager.to_envvar(f"{credential_name}_PASSPHRASE", passphrase)
-        ]
-        envs.append(k8s.V1EnvVar(name=f"{credential_name}_TYPE", value='CLIENT_CERT_WITH_KEY'))
-        return envs
-    raise ValueError(f"Unsupported credential type '{credential_type}' for credential '{credential_name}'")
+        Also accepts lowercase keys for flexibility.
+        """
+        secret_data = self._read_secret(credential_name)
+        public_cert: str = secret_data.get('PUBLIC_CERT', '') or secret_data.get('public_cert', '')
+        private_key: str = secret_data.get('PRIVATE_KEY', '') or secret_data.get('private_key', '')
+        passphrase: str = secret_data.get('PASSPHRASE', '') or secret_data.get('passphrase', '')
 
+        if not public_cert or not private_key:
+            raise Exception(f"Secret '{credential_name}' missing required keys: PUBLIC_CERT, PRIVATE_KEY")
+
+        return public_cert, private_key, passphrase
+
+    def getCaCertBundle(self, credential_name: str) -> str:
+        """
+        Read a CA certificate bundle from a Kubernetes secret.
+
+        Expected secret format:
+        - Key: CA_CERT -> value: PEM-encoded CA bundle content
+
+        Also accepts lowercase (ca_cert) for flexibility.
+        """
+        secret_data = self._read_secret(credential_name)
+        ca_cert: str = secret_data.get('CA_CERT', '') or secret_data.get('ca_cert', '')
+
+        if not ca_cert:
+            raise Exception(f"Secret '{credential_name}' missing required key: CA_CERT")
+
+        return ca_cert
+
+secret_manager = K8sSecretManager(namespace='ds-scale')
 
 def build_otlp_env_vars(config: Dict, default_port: int = 4318) -> List[k8s.V1EnvVar]:
     """Build OpenTelemetry OTLP environment variables for node-local agent access.
@@ -438,37 +560,25 @@ start_task = EmptyOperator(
     dag=dag
 )
 
-# Environment variables for all tasks
-common_env_vars = [
+# Environment variables for the model merge task.
+model_merge_env_vars = [
     # Platform configuration (literal values)
     k8s.V1EnvVar(name='DATASURFACE_PSP_NAME', value='demo-psp'),
-    k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value='ds-nightly'),
+    k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value='ds-scale'),
 ]
 
-# Merge and Git credentials (typed)
-common_env_vars.extend(build_env_vars_for_credential(
+# Model merge needs only the merge database and model Git credentials.
+model_merge_env_vars.extend(secret_manager.getCredential(
     'sqlserver-demo-merge',
     'USER_PASSWORD'
 ))
-common_env_vars.extend(build_env_vars_for_credential(
+model_merge_env_vars.extend(secret_manager.getCredential(
     'git',
     'API_TOKEN'
 ))
 
-
-# CRG credentials needed by the infra merge pod to populate CQRS/DC reconcile DAG tables
-
-common_env_vars.extend(build_env_vars_for_credential(
-    'sqlserver-demo-merge',
-    'USER_PASSWORD'
-))
-
-
-
-
-
 # OpenTelemetry OTLP configuration for node-local agent access
-common_env_vars.extend(build_otlp_env_vars({
+model_merge_env_vars.extend(build_otlp_env_vars({
     'otlp_enabled': False,
     'otlp_port': 4318,
     
@@ -479,8 +589,8 @@ common_env_vars.extend(build_otlp_env_vars({
 merge_task = KubernetesPodOperator(
     task_id='infrastructure_merge_task',
     name='demo-psp-infra-merge',
-    namespace='ds-nightly',
-    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.3.5',
+    namespace='ds-scale',
+    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.26',
     cmds=['/bin/bash'],
     arguments=[
         '-c',
@@ -523,7 +633,7 @@ merge_task = KubernetesPodOperator(
         fi
         '''
     ],
-    env_vars=common_env_vars,  # type: ignore
+    env_vars=model_merge_env_vars,  # type: ignore
     
     volumes=[
         k8s.V1Volume(
@@ -550,7 +660,7 @@ merge_task = KubernetesPodOperator(
         )
     ],
     
-    on_finish_action="delete_succeeded_pod",
+    on_finish_action="delete_pod",
     get_logs=True,
     dag=dag
 )
@@ -728,7 +838,7 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
     t_cred_name = trigger_config.get('credential_secret_name')
     t_cred_type = trigger_config.get('credential_secret_type')
     if t_cred_name and t_cred_type:
-        env_vars.extend(build_env_vars_for_credential(t_cred_name, t_cred_type))
+        env_vars.extend(secret_manager.getCredential(t_cred_name, t_cred_type))
 
     # Function to determine next action based on job return code
     def determine_next_action(**context):
@@ -789,7 +899,7 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
         volume_mounts=_mounts,
         resources=pod_resources_from_limits(
             stream_config.get('job_limits', {}),
-            {'requested_memory': '256Mi', 'requested_cpu': '100m', 'limits_memory': '256Mi', 'limits_cpu': '100m'}
+            {'requested_memory': '256Mi', 'requested_cpu': '100m', 'limits_memory': '256Mi', 'limits_cpu': '1000m'}
         ),
         dag=dag,
         priority_weight=stream_config.get('priority', 0),
@@ -999,24 +1109,24 @@ def build_common_env_vars(platform_config: PlatformConfig):
         k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value=platform_config['namespace_name'])
     ]
     # Merge credential
-    base.extend(build_env_vars_for_credential(
+    base.extend(secret_manager.getCredential(
         platform_config['merge_db_credential_secret_name'],
         platform_config['merge_db_credential_secret_type']
     ))
     # Git credential
-    base.extend(build_env_vars_for_credential(
+    base.extend(secret_manager.getCredential(
         platform_config['git_credential_secret_name'],
         platform_config['git_credential_secret_type']
     ))
     # Event publish credential (for Kafka event publishing)
     if platform_config.get('event_publish_credential_secret_name'):
-        base.extend(build_env_vars_for_credential(
+        base.extend(secret_manager.getCredential(
             platform_config['event_publish_credential_secret_name'],
             platform_config['event_publish_credential_secret_type']
         ))
     # Bulk object storage writer credential (for Parquet-on-S3 bulk staging)
     if platform_config.get('bulk_object_storage_credential_secret_name'):
-        base.extend(build_env_vars_for_credential(
+        base.extend(secret_manager.getCredential(
             platform_config['bulk_object_storage_credential_secret_name'],
             platform_config['bulk_object_storage_credential_secret_type']
         ))
@@ -1030,7 +1140,7 @@ def maybe_add_source_db_env(env_vars, platform_config: PlatformConfig, stream_co
     if (stream_config.get('ingestion_type') == 'sql_source' and
         stream_config.get('source_credential_secret_name') and
         stream_config['source_credential_secret_name'] != platform_config['merge_db_credential_secret_name']):
-        env_vars.extend(build_env_vars_for_credential(
+        env_vars.extend(secret_manager.getCredential(
             stream_config['source_credential_secret_name'],
             stream_config['source_credential_secret_type']
         ))
@@ -1094,7 +1204,9 @@ def build_pod_operator(
     
     Airflow 3.x Notes:
     - is_delete_operator_pod is deprecated, use on_finish_action instead
-    - on_finish_action="delete_succeeded_pod" keeps failed pods for debugging
+    - on_finish_action="delete_pod" deletes failed pods too; otherwise an
+      ImagePullBackOff pod can wake up after credentials/image state is fixed
+      and become a stale concurrent writer for an already-failed Airflow run.
     - log_events_on_failure=True captures K8s events when pod fails
     """
     kwargs = {
@@ -1111,9 +1223,11 @@ def build_pod_operator(
         'get_logs': True,
         'do_xcom_push': do_xcom_push,
         'container_resources': resources,
-        # Airflow 3.x: Use on_finish_action instead of deprecated is_delete_operator_pod
-        # delete_succeeded_pod: keeps failed pods for debugging, deletes successful ones
-        'on_finish_action': "delete_succeeded_pod",
+        # Airflow 3.x: Use on_finish_action instead of deprecated is_delete_operator_pod.
+        # Delete failed pods too. Airflow task logs and K8s events are the source of truth;
+        # leaving failed pods behind can let ImagePullBackOff pods later start as stale
+        # writers after the Airflow run has already failed.
+        'on_finish_action': "delete_pod",
         # Log K8s events when pod fails - helps debug container startup issues
         'log_events_on_failure': True,
         'dag': dag,
@@ -1304,7 +1418,7 @@ def _create_single_ingestion_dag(dag_id: str, platform: str) -> Optional[DAG]:
             credential_secret_name='sqlserver-demo-merge',
             credential_secret_type='USER_PASSWORD',
             driver='mssql+pyodbc',
-            host='ds-nightly-test-sqlserver.database.windows.net',
+            host='ds-scale-merge-06030935-f006.database.windows.net',
             port=1433,
             database='merge_db',
             query_driver='ODBC Driver 18 for SQL Server'
@@ -1356,7 +1470,7 @@ def _create_single_datatransformer_dag(dag_id: str, platform: str) -> Optional[D
             credential_secret_name='sqlserver-demo-merge',
             credential_secret_type='USER_PASSWORD',
             driver='mssql+pyodbc',
-            host='ds-nightly-test-sqlserver.database.windows.net',
+            host='ds-scale-merge-06030935-f006.database.windows.net',
             port=1433,
             database='merge_db',
             query_driver='ODBC Driver 18 for SQL Server'
@@ -1408,7 +1522,7 @@ def _create_single_cqrs_dag(dag_id: str) -> Optional[DAG]:
             credential_secret_name='sqlserver-demo-merge',
             credential_secret_type='USER_PASSWORD',
             driver='mssql+pyodbc',
-            host='ds-nightly-test-sqlserver.database.windows.net',
+            host='ds-scale-merge-06030935-f006.database.windows.net',
             port=1433,
             database='merge_db',
             query_driver='ODBC Driver 18 for SQL Server'
@@ -1445,7 +1559,7 @@ def _create_single_factory_dag(dag_id: str) -> Optional[DAG]:
             credential_secret_name='sqlserver-demo-merge',
             credential_secret_type='USER_PASSWORD',
             driver='mssql+pyodbc',
-            host='ds-nightly-test-sqlserver.database.windows.net',
+            host='ds-scale-merge-06030935-f006.database.windows.net',
             port=1433,
             database='merge_db',
             query_driver='ODBC Driver 18 for SQL Server'
@@ -1481,7 +1595,7 @@ def _create_single_dt_factory_dag(dag_id: str) -> Optional[DAG]:
             credential_secret_name='sqlserver-demo-merge',
             credential_secret_type='USER_PASSWORD',
             driver='mssql+pyodbc',
-            host='ds-nightly-test-sqlserver.database.windows.net',
+            host='ds-scale-merge-06030935-f006.database.windows.net',
             port=1433,
             database='merge_db',
             query_driver='ODBC Driver 18 for SQL Server'
@@ -1786,7 +1900,7 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
     ]
 
     # Always include the platform git credential env vars using typed helper
-    base_env_vars.extend(build_env_vars_for_credential(
+    base_env_vars.extend(secret_manager.getCredential(
         platform_config['git_credential_secret_name'],
         platform_config['git_credential_secret_type']
     ))
@@ -1795,7 +1909,7 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
     base_env_vars.extend(build_otlp_env_vars(platform_config))
 
     # Merge credential env vars (for infra/reset/output tasks)
-    merge_env_vars = build_env_vars_for_credential(
+    merge_env_vars = secret_manager.getCredential(
         platform_config['merge_db_credential_secret_name'],
         platform_config['merge_db_credential_secret_type']
     )
@@ -1807,13 +1921,13 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
     
     dt_env_base = dt_config['dt_credential_secret_name']
     dt_type = dt_config['dt_credential_secret_type']
-    dt_only_env_vars.extend(build_env_vars_for_credential(dt_env_base, dt_type))
+    dt_only_env_vars.extend(secret_manager.getCredential(dt_env_base, dt_type))
 
     # If DataTransformer uses a different git credential, add that TOKEN only to the transformer env
     transformer_extra_git_env = []
     if (dt_config.get('git_credential_secret_name') and
         dt_config['git_credential_secret_name'] != platform_config['git_credential_secret_name']):
-        transformer_extra_git_env.extend(build_env_vars_for_credential(
+        transformer_extra_git_env.extend(secret_manager.getCredential(
             dt_config['git_credential_secret_name'],
             dt_config['git_credential_secret_type']
         ))
@@ -1826,21 +1940,20 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
             if not isinstance(cred_entry, (list, tuple)) or len(cred_entry) != 2:
                 continue
             cred_name, cred_type = cred_entry[0], cred_entry[1]
-            dt_extra_env_vars.extend(build_env_vars_for_credential(cred_name, cred_type))
+            dt_extra_env_vars.extend(secret_manager.getCredential(cred_name, cred_type))
 
     # CRG credential env vars (for output ingestion to read from DataTransformer output database)
     crg_env_vars = []
     if dt_config.get('dt_crg_credential_secret_name'):
-        crg_user, crg_password = secret_manager.getUserPassword(dt_config['dt_crg_credential_secret_name'])
-        crg_env_vars.extend([
-            SecretManager.to_envvar(f"{dt_config['dt_crg_credential_secret_name']}_USER", crg_user),
-            SecretManager.to_envvar(f"{dt_config['dt_crg_credential_secret_name']}_PASSWORD", crg_password)
-        ])
+        crg_env_vars.extend(secret_manager.getCredential(
+            dt_config['dt_crg_credential_secret_name'],
+            'USER_PASSWORD'
+        ))
 
     # Event publish credential env vars (for Kafka event publishing)
     event_publish_env_vars = []
     if platform_config.get('event_publish_credential_secret_name'):
-        event_publish_env_vars.extend(build_env_vars_for_credential(
+        event_publish_env_vars.extend(secret_manager.getCredential(
             platform_config['event_publish_credential_secret_name'],
             platform_config['event_publish_credential_secret_type']
         ))
@@ -1848,7 +1961,7 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
     # Bulk object storage writer credential env vars (for Parquet-on-S3 bulk staging)
     bulk_object_storage_env_vars = []
     if platform_config.get('bulk_object_storage_credential_secret_name'):
-        bulk_object_storage_env_vars.extend(build_env_vars_for_credential(
+        bulk_object_storage_env_vars.extend(secret_manager.getCredential(
             platform_config['bulk_object_storage_credential_secret_name'],
             platform_config['bulk_object_storage_credential_secret_type']
         ))
@@ -1974,7 +2087,7 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
         trigger_rule='all_success',  # Only run if datatransformer_job succeeds
         resources=pod_resources_from_limits(
             dt_config.get('output_job_limits', {}),
-            {'requested_memory': '256Mi', 'requested_cpu': '100m', 'limits_memory': '1Gi', 'limits_cpu': '500m'}
+            {'requested_memory': '256Mi', 'requested_cpu': '100m', 'limits_memory': '1Gi', 'limits_cpu': '1000m'}
         ),
         dag=dag,
         priority_weight=dt_config.get('priority', 0),
@@ -2243,29 +2356,31 @@ def create_dc_reconcile_dag(config: dict) -> DAG:
     )
 
     # Environment variables for the reconcile job
-    merge_user, merge_password = secret_manager.getUserPassword(config['merge_db_credential_secret_name'])
-    pat_secret = secret_manager.getPATSecret(config['git_credential_secret_name'])
     env_vars = [
         k8s.V1EnvVar(name='DATASURFACE_PSP_NAME', value=psp_name),
         k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value=config['namespace_name']),
-        SecretManager.to_envvar(f"{config['merge_db_credential_secret_name']}_USER", merge_user),
-        SecretManager.to_envvar(f"{config['merge_db_credential_secret_name']}_PASSWORD", merge_password),
-        SecretManager.to_envvar(f"{config['git_credential_secret_name']}_TOKEN", pat_secret),
     ]
+    env_vars.extend(secret_manager.getCredential(
+        config['merge_db_credential_secret_name'],
+        config['merge_db_credential_secret_type']
+    ))
+    env_vars.extend(secret_manager.getCredential(
+        config['git_credential_secret_name'],
+        config['git_credential_secret_type']
+    ))
     # OpenTelemetry OTLP configuration
     env_vars.extend(build_otlp_env_vars(config))
 
     # Add DataContainer credential (needed to reconcile views on that container)
     if config.get('dc_credential_secret_name'):
-        dc_user, dc_password = secret_manager.getUserPassword(config['dc_credential_secret_name'])
-        env_vars.extend([
-            SecretManager.to_envvar(f"{config['dc_credential_secret_name']}_USER", dc_user),
-            SecretManager.to_envvar(f"{config['dc_credential_secret_name']}_PASSWORD", dc_password),
-        ])
+        env_vars.extend(secret_manager.getCredential(
+            config['dc_credential_secret_name'],
+            config['dc_credential_secret_type']
+        ))
 
     # Event publish credential (for Kafka event publishing)
     if config.get('event_publish_credential_secret_name'):
-        env_vars.extend(build_env_vars_for_credential(
+        env_vars.extend(secret_manager.getCredential(
             config['event_publish_credential_secret_name'],
             config['event_publish_credential_secret_type']
         ))
@@ -2343,32 +2458,47 @@ def create_cqrs_execution_dag(config: dict) -> DAG:
         is_paused_upon_creation=False
     )
     
-    # Environment variables for the CQRS job - build manually for CQRS
-    merge_user, merge_password = secret_manager.getUserPassword(config['merge_db_credential_secret_name'])
-    pat_secret = secret_manager.getPATSecret(config['git_credential_secret_name'])
-    cqrs_user, cqrs_password = secret_manager.getUserPassword(config['cqrs_credential_secret_name'])
+    # Environment variables for the CQRS job
     env_vars = [
         k8s.V1EnvVar(name='DATASURFACE_PSP_NAME', value=psp_name),
         k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value=config['namespace_name']),
-        SecretManager.to_envvar(f"{config['merge_db_credential_secret_name']}_USER", merge_user),
-        SecretManager.to_envvar(f"{config['merge_db_credential_secret_name']}_PASSWORD", merge_password),
-        SecretManager.to_envvar(f"{config['git_credential_secret_name']}_TOKEN", pat_secret),
-        SecretManager.to_envvar(f"{config['cqrs_credential_secret_name']}_USER", cqrs_user),
-        SecretManager.to_envvar(f"{config['cqrs_credential_secret_name']}_PASSWORD", cqrs_password),
     ]
+    env_vars.extend(secret_manager.getCredential(
+        config['merge_db_credential_secret_name'],
+        config['merge_db_credential_secret_type']
+    ))
+    env_vars.extend(secret_manager.getCredential(
+        config['git_credential_secret_name'],
+        config['git_credential_secret_type']
+    ))
+    env_vars.extend(secret_manager.getCredential(
+        config['cqrs_credential_secret_name'],
+        config['cqrs_credential_secret_type']
+    ))
     # OpenTelemetry OTLP configuration
     env_vars.extend(build_otlp_env_vars(config))
 
     # Event publish credential (for Kafka event publishing)
     if config.get('event_publish_credential_secret_name'):
-        env_vars.extend(build_env_vars_for_credential(
+        env_vars.extend(secret_manager.getCredential(
             config['event_publish_credential_secret_name'],
             config['event_publish_credential_secret_type']
         ))
-    
+
+    # Bulk object storage writer credential (for Parquet-on-S3 bulk staging
+    # into the CRG data container). Only present when the CRG has a per-DC
+    # BulkObjectStorageBinding configured for this data container. The PSP's
+    # bulk credential is intentionally not injected here — the CRG container
+    # may live in a different cloud or use a different writer principal.
+    if config.get('bulk_object_storage_credential_secret_name'):
+        env_vars.extend(secret_manager.getCredential(
+            config['bulk_object_storage_credential_secret_name'],
+            config['bulk_object_storage_credential_secret_type']
+        ))
+
     # Git cache mounts
     _vols, _mounts = git_cache_mounts(config.get('git_cache_enabled'))
-    
+
     # CQRS sync job
     cqrs_job = build_pod_operator(
         task_id='cqrs_sync_job',
@@ -2391,6 +2521,7 @@ def create_cqrs_execution_dag(config: dict) -> DAG:
             '--rte-name', 'demo',
             '--max-cache-age-minutes', str(config.get('git_cache_max_age_minutes', 5))
         ] + (['--git-release-selector', config['git_release_selector']] if config.get('git_release_selector') else []) \
+          + (['--max-workers', str(config['max_workers'])] if config.get('max_workers') is not None else []) \
           + (['--use-git-cache'] if config.get('git_cache_enabled') else []),
         env_vars=env_vars,
         image_pull_policy='IfNotPresent',
@@ -2398,7 +2529,7 @@ def create_cqrs_execution_dag(config: dict) -> DAG:
         volume_mounts=_mounts,
         resources=pod_resources_from_limits(
             config.get('job_limits', {}),
-            {'requested_memory': '512Mi', 'requested_cpu': '200m', 'limits_memory': '1Gi', 'limits_cpu': '500m'}
+            {'requested_memory': '512Mi', 'requested_cpu': '200m', 'limits_memory': '1Gi', 'limits_cpu': '1000m'}
         ),
         dag=dag,
         priority_weight=0,
@@ -2422,7 +2553,7 @@ def load_cqrs_configurations() -> dict:
             credential_secret_name='sqlserver-demo-merge',
             credential_secret_type='USER_PASSWORD',
             driver='mssql+pyodbc',
-            host='ds-nightly-test-sqlserver.database.windows.net',
+            host='ds-scale-merge-06030935-f006.database.windows.net',
             port=1433,
             database='merge_db',
             query_driver='ODBC Driver 18 for SQL Server'
@@ -2477,7 +2608,7 @@ def load_dc_reconcile_configurations() -> dict:
             credential_secret_name='sqlserver-demo-merge',
             credential_secret_type='USER_PASSWORD',
             driver='mssql+pyodbc',
-            host='ds-nightly-test-sqlserver.database.windows.net',
+            host='ds-scale-merge-06030935-f006.database.windows.net',
             port=1433,
             database='merge_db',
             query_driver='ODBC Driver 18 for SQL Server'
@@ -2604,7 +2735,7 @@ def create_factory_dags_from_database(silent: bool = False, **context):
                 log_message(f"Missing Merge SQL credentials - factory DAGs will be created during task execution: {e}")
                 return "Factory DAG creation deferred to task execution"
 
-        merge_db_host = 'ds-nightly-test-sqlserver.database.windows.net'
+        merge_db_host = 'ds-scale-merge-06030935-f006.database.windows.net'
         merge_db_port = 1433
         merge_db_db_name = 'merge_db'
         merge_db_query = 'ODBC Driver 18 for SQL Server'
