@@ -677,7 +677,7 @@ merge_task = KubernetesPodOperator(
         )
     ],
     
-    on_finish_action="delete_pod",
+    on_finish_action="delete_succeeded_pod",
     get_logs=True,
     dag=dag
 )
@@ -1221,9 +1221,8 @@ def build_pod_operator(
     
     Airflow 3.x Notes:
     - is_delete_operator_pod is deprecated, use on_finish_action instead
-    - on_finish_action="delete_pod" deletes failed pods too; otherwise an
-      ImagePullBackOff pod can wake up after credentials/image state is fixed
-      and become a stale concurrent writer for an already-failed Airflow run.
+    - on_finish_action="delete_succeeded_pod" keeps failed pods for debugging
+      while still cleaning up successful pods.
     - log_events_on_failure=True captures K8s events when pod fails
     """
     kwargs = {
@@ -1241,10 +1240,8 @@ def build_pod_operator(
         'do_xcom_push': do_xcom_push,
         'container_resources': resources,
         # Airflow 3.x: Use on_finish_action instead of deprecated is_delete_operator_pod.
-        # Delete failed pods too. Airflow task logs and K8s events are the source of truth;
-        # leaving failed pods behind can let ImagePullBackOff pods later start as stale
-        # writers after the Airflow run has already failed.
-        'on_finish_action': "delete_pod",
+        # Keep failed pods for debugging; successful pods are still cleaned up.
+        'on_finish_action': "delete_succeeded_pod",
         # Log K8s events when pod fails - helps debug container startup issues
         'log_events_on_failure': True,
         'dag': dag,
