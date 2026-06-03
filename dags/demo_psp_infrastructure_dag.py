@@ -560,25 +560,42 @@ start_task = EmptyOperator(
     dag=dag
 )
 
-# Environment variables for the model merge task.
-model_merge_env_vars = [
+# Environment variables for all tasks
+common_env_vars = [
     # Platform configuration (literal values)
     k8s.V1EnvVar(name='DATASURFACE_PSP_NAME', value='demo-psp'),
     k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value='ds-scale'),
 ]
 
-# Model merge needs only the merge database and model Git credentials.
-model_merge_env_vars.extend(secret_manager.getCredential(
+# Merge and Git credentials (typed)
+common_env_vars.extend(secret_manager.getCredential(
     'sqlserver-demo-merge',
     'USER_PASSWORD'
 ))
-model_merge_env_vars.extend(secret_manager.getCredential(
+common_env_vars.extend(secret_manager.getCredential(
     'git',
     'API_TOKEN'
 ))
 
+
+# CRG credentials needed by the infra merge pod to populate CQRS/DC reconcile DAG tables
+
+common_env_vars.extend(secret_manager.getCredential(
+    'sqlserver-cqrs',
+    'USER_PASSWORD'
+))
+
+common_env_vars.extend(secret_manager.getCredential(
+    'sqlserver-demo-merge',
+    'USER_PASSWORD'
+))
+
+
+
+
+
 # OpenTelemetry OTLP configuration for node-local agent access
-model_merge_env_vars.extend(build_otlp_env_vars({
+common_env_vars.extend(build_otlp_env_vars({
     'otlp_enabled': False,
     'otlp_port': 4318,
     
@@ -633,7 +650,7 @@ merge_task = KubernetesPodOperator(
         fi
         '''
     ],
-    env_vars=model_merge_env_vars,  # type: ignore
+    env_vars=common_env_vars,  # type: ignore
     
     volumes=[
         k8s.V1Volume(
