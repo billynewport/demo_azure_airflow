@@ -1267,7 +1267,9 @@ def choose_next_action_from_log(content, strict: bool):
     """Decide next action from log content.
     - If DATASURFACE_RESULT_CODE is present: 1->reschedule, 0->wait, else error (strict) or wait.
     - Else, fall back to keywords used by DataTransformer jobs.
-    - If nothing conclusive: error (strict) or wait.
+    - If nothing conclusive: wait. KubernetesExecutor task logs can be ephemeral
+      across worker pods, and reaching check_result already means upstream tasks
+      satisfied trigger_rule='all_success'.
     """
     import re
     if content:
@@ -1286,9 +1288,8 @@ def choose_next_action_from_log(content, strict: bool):
             return 'reschedule_immediately'
         if "JOB_COMPLETED_SUCCESSFULLY" in content:
             return 'wait_for_trigger'
-    # No content or no recognizable markers
-    if strict:
-        raise Exception("No result code found in logs")
+    # No content or no recognizable markers. Do not fail a successful upstream
+    # task just because its KubernetesExecutor worker log is not local here.
     return 'wait_for_trigger'
 
 
