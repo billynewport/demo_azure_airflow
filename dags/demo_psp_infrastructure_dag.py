@@ -599,7 +599,7 @@ merge_task = KubernetesPodOperator(
     task_id='infrastructure_merge_task',
     name='demo-psp-infra-merge',
     namespace='ds-scale',
-    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.27',
+    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.34',
     cmds=['/bin/bash'],
     arguments=[
         '-c',
@@ -669,7 +669,7 @@ merge_task = KubernetesPodOperator(
         )
     ],
     
-    on_finish_action="delete_succeeded_pod",
+    on_finish_action="delete_pod",
     get_logs=True,
     priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
     weight_rule=SYSTEM_DAG_WEIGHT_RULE,
@@ -1221,8 +1221,9 @@ def build_pod_operator(
     
     Airflow 3.x Notes:
     - is_delete_operator_pod is deprecated, use on_finish_action instead
-    - on_finish_action="delete_succeeded_pod" keeps failed pods for debugging
-      while still cleaning up successful pods.
+    - on_finish_action="delete_pod" deletes failed pods too; otherwise an
+      ImagePullBackOff pod can wake up after credentials/image state is fixed
+      and become a stale concurrent writer for an already-failed Airflow run.
     - log_events_on_failure=True captures K8s events when pod fails
     """
     kwargs = {
@@ -1240,8 +1241,10 @@ def build_pod_operator(
         'do_xcom_push': do_xcom_push,
         'container_resources': resources,
         # Airflow 3.x: Use on_finish_action instead of deprecated is_delete_operator_pod.
-        # Keep failed pods for debugging; successful pods are still cleaned up.
-        'on_finish_action': "delete_succeeded_pod",
+        # Delete failed pods too. Airflow task logs and K8s events are the source of truth;
+        # leaving failed pods behind can let ImagePullBackOff pods later start as stale
+        # writers after the Airflow run has already failed.
+        'on_finish_action': "delete_pod",
         # Log K8s events when pod fails - helps debug container startup issues
         'log_events_on_failure': True,
         'dag': dag,
@@ -1830,7 +1833,6 @@ def sync_dynamic_dags(config: PlatformConfig, **context):
 def create_platform_factory_dag(config: PlatformConfig) -> DAG:
     """Create a platform factory DAG from configuration - identical to yellow_platform_factory_dag.py.j2"""
     platform_name = config['platform_name']
-
     factory_default_args = {
         'priority_weight': SYSTEM_DAG_PRIORITY_WEIGHT,
         'weight_rule': SYSTEM_DAG_WEIGHT_RULE,
@@ -2457,9 +2459,19 @@ def create_cqrs_execution_dag(config: dict) -> DAG:
     crg_name = config['crg_name']
     data_container_name = config['data_container_name']
     schedule_string = config['schedule_string']
+    worker_id = int(config.get('worker_id', 0))
+    max_workers = int(config.get('max_workers', 1))
+    if max_workers <= 0:
+        raise ValueError(f"CQRS max_workers must be greater than 0, got {max_workers}")
+    if worker_id < 0 or worker_id >= max_workers:
+        raise ValueError(f"CQRS worker_id must be in [0, {max_workers}), got {worker_id}")
     
     # Create unique DAG ID
-    dag_id = f"{psp_name}_{crg_name}_{data_container_name}_cqrs"
+    dag_id = config.get('dag_id') or (
+        f"{psp_name}_{crg_name}_{data_container_name}_cqrs"
+        if max_workers <= 1
+        else f"{psp_name}_{crg_name}_{data_container_name}_{worker_id}_cqrs"
+    )
     
     # Default arguments for CQRS DAGs
     default_args = {
@@ -2476,11 +2488,11 @@ def create_cqrs_execution_dag(config: dict) -> DAG:
     dag = DAG(
         dag_id,
         default_args=default_args,
-        description=f'CQRS sync DAG for {psp_name}/{crg_name}/{data_container_name}',
+        description=f'CQRS sync DAG for {psp_name}/{crg_name}/{data_container_name} worker {worker_id + 1}/{max_workers}',
         schedule=schedule_string,  # Run every X minutes - configurable per deployment needs
         catchup=False,
         max_active_runs=1,
-        tags=['datasurface', 'cqrs_sync', psp_name, crg_name, f'{psp_name}.{crg_name}', data_container_name],
+        tags=['datasurface', 'cqrs_sync', psp_name, crg_name, f'{psp_name}.{crg_name}', data_container_name, f'worker-{worker_id}'],
         is_paused_upon_creation=False
     )
     
@@ -2524,11 +2536,14 @@ def create_cqrs_execution_dag(config: dict) -> DAG:
 
     # Git cache mounts
     _vols, _mounts = git_cache_mounts(config.get('git_cache_enabled'))
+    cqrs_pod_name = f"{psp_name}-{crg_name}-{data_container_name}-cqrs"
+    if max_workers > 1:
+        cqrs_pod_name = f"{cqrs_pod_name}-w{worker_id}"
 
     # CQRS sync job
     cqrs_job = build_pod_operator(
         task_id='cqrs_sync_job',
-        name=f"{psp_name}-{crg_name}-{data_container_name}-cqrs",
+        name=cqrs_pod_name,
         namespace=config['namespace_name'],
         image=config['datasurface_docker_image'],
         cmds=['python', '-m', 'datasurface.platforms.yellow.jobs_cqrs'],
@@ -2545,9 +2560,10 @@ def create_cqrs_execution_dag(config: dict) -> DAG:
             '--git-repo-branch', config['git_repo_branch'],
             '--git-platform-repo-credential-name', config['git_credential_name'],
             '--rte-name', 'demo',
-            '--max-cache-age-minutes', str(config.get('git_cache_max_age_minutes', 5))
+            '--max-cache-age-minutes', str(config.get('git_cache_max_age_minutes', 5)),
+            '--worker-id', str(worker_id),
+            '--num-workers', str(max_workers)
         ] + (['--git-release-selector', config['git_release_selector']] if config.get('git_release_selector') else []) \
-          + (['--max-workers', str(config['max_workers'])] if config.get('max_workers') is not None else []) \
           + (['--use-git-cache'] if config.get('git_cache_enabled') else []),
         env_vars=env_vars,
         image_pull_policy='IfNotPresent',
