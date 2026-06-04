@@ -53,6 +53,11 @@ _silent_mode = False
 _num_shards = 1
 _shard_number = 0
 
+# Airflow schedules queued tasks by priority_weight when pool/executor slots free up.
+# Keep system/factory control-plane DAGs ahead of high-volume data-plane DAGs.
+SYSTEM_DAG_PRIORITY_WEIGHT = 2_147_483_647
+SYSTEM_DAG_WEIGHT_RULE = 'absolute'
+
 
 def _get_shard_filter() -> str:
     """Return SQL WHERE clause fragment for shard filtering, or empty string if not sharded."""
@@ -540,6 +545,8 @@ default_args = {
     'email_on_retry': False,
     'retries': 0,  # No retries for infrastructure tasks - validation errors should fail immediately
     'retry_delay': timedelta(minutes=5),
+    'priority_weight': SYSTEM_DAG_PRIORITY_WEIGHT,
+    'weight_rule': SYSTEM_DAG_WEIGHT_RULE,
 }
 
 # Create the DAG
@@ -557,6 +564,8 @@ dag = DAG(
 # Start task
 start_task = EmptyOperator(
     task_id='start_infrastructure_tasks',
+    priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
+    weight_rule=SYSTEM_DAG_WEIGHT_RULE,
     dag=dag
 )
 
@@ -662,6 +671,8 @@ merge_task = KubernetesPodOperator(
     
     on_finish_action="delete_succeeded_pod",
     get_logs=True,
+    priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
+    weight_rule=SYSTEM_DAG_WEIGHT_RULE,
     dag=dag
 )
 
@@ -672,18 +683,24 @@ merge_task = KubernetesPodOperator(
 # Metrics Collector Task - Placeholder for future metrics collection
 metrics_collector_task = EmptyOperator(
     task_id='metrics_collector_task',
+    priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
+    weight_rule=SYSTEM_DAG_WEIGHT_RULE,
     dag=dag
 )
 
 # Apply Security Task - Placeholder for future security operations
 apply_security_task = EmptyOperator(
     task_id='apply_security_task',
+    priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
+    weight_rule=SYSTEM_DAG_WEIGHT_RULE,
     dag=dag
 )
 
 # Table Removal Task - Placeholder for future table cleanup operations
 table_removal_task = EmptyOperator(
     task_id='table_removal_task',
+    priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
+    weight_rule=SYSTEM_DAG_WEIGHT_RULE,
     dag=dag
 )
 
@@ -1814,9 +1831,15 @@ def create_platform_factory_dag(config: PlatformConfig) -> DAG:
     """Create a platform factory DAG from configuration - identical to yellow_platform_factory_dag.py.j2"""
     platform_name = config['platform_name']
 
+    factory_default_args = {
+        'priority_weight': SYSTEM_DAG_PRIORITY_WEIGHT,
+        'weight_rule': SYSTEM_DAG_WEIGHT_RULE,
+    }
+
     # Create the visible Factory DAG that appears in Airflow UI
     factory_dag = DAG(
         f'{platform_name}_factory_dag',
+        default_args=factory_default_args,
         description=f'Factory DAG for {platform_name} - Creates and manages dynamic ingestion stream DAGs',
         schedule='*/5 * * * *',  # Check for configuration changes every 5 minutes
         start_date=datetime(2025, 1, 1),
@@ -1831,6 +1854,8 @@ def create_platform_factory_dag(config: PlatformConfig) -> DAG:
     sync_task = PythonOperator(
         task_id='sync_dynamic_dags',
         python_callable=lambda **context: sync_dynamic_dags(config, **context),
+        priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
+        weight_rule=SYSTEM_DAG_WEIGHT_RULE,
         dag=factory_dag
     )
 
@@ -2287,6 +2312,8 @@ def create_datatransformer_factory_dag(config: PlatformConfig) -> DAG:
         'email_on_retry': False,
         'retries': 1,
         'retry_delay': timedelta(minutes=5),
+        'priority_weight': SYSTEM_DAG_PRIORITY_WEIGHT,
+        'weight_rule': SYSTEM_DAG_WEIGHT_RULE,
     }
 
     factory_dag = DAG(
@@ -2305,6 +2332,8 @@ def create_datatransformer_factory_dag(config: PlatformConfig) -> DAG:
     sync_task = PythonOperator(
         task_id='sync_datatransformer_dags',
         python_callable=lambda **context: sync_datatransformer_dags(config, **context),
+        priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
+        weight_rule=SYSTEM_DAG_WEIGHT_RULE,
         dag=factory_dag
     )
 
@@ -2873,12 +2902,16 @@ else:
 factory_creation_task = PythonOperator(
     task_id='create_factory_and_cqrs_dags',
     python_callable=create_factory_dags_from_database,
+    priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
+    weight_rule=SYSTEM_DAG_WEIGHT_RULE,
     dag=dag
 )
 
 # End task
 end_task = EmptyOperator(
     task_id='end_infrastructure_tasks',
+    priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
+    weight_rule=SYSTEM_DAG_WEIGHT_RULE,
     dag=dag
 )
 
