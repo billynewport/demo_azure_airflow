@@ -2444,7 +2444,7 @@ def create_dc_reconcile_dag(config: dict) -> DAG:
             {'requested_memory': '512Mi', 'requested_cpu': '200m', 'limits_memory': '2Gi', 'limits_cpu': '1000m'}
         ),
         dag=dag,
-        priority_weight=0,
+        priority_weight=SYSTEM_DAG_PRIORITY_WEIGHT,
         weight_rule='absolute',
         do_xcom_push=False,
     )
