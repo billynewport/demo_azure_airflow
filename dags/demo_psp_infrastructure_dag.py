@@ -39,7 +39,10 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from abc import ABC, abstractmethod
 from typing import Tuple
-from airflow.utils.dag_parsing_context import get_parsing_context
+try:
+    from airflow.sdk.definitions.context import get_parsing_context
+except ImportError:
+    from airflow.utils.dag_parsing_context import get_parsing_context
 
 # Airflow 3.x: Use standard Python logging instead of task_instance.log
 _logger = logging.getLogger(__name__)
