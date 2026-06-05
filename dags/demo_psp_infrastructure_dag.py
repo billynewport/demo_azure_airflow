@@ -863,14 +863,27 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
         dag_run = context['dag_run']
         # Determine the correct task name based on DAG type
         task_name = "output_ingestion_job" if "_dt_ingestion" in dag_run.dag_id else "snapshot_merge_job"
-        content = read_latest_task_log(dag_run.dag_id, dag_run.run_id, task_name)
-        result = choose_next_action_from_log(content, strict=True)
-        
+        ti = context['ti']
+
+        task_state = _get_task_instance_state(dag_run.dag_id, dag_run.run_id, task_name)
+        if task_state != 'success':
+            reason = f"{task_name} finished in state {task_state or 'unknown'}"
+            ti.xcom_push(key='branch_success', value=False)
+            ti.xcom_push(key='failure_reason', value=reason)
+            return 'record_ingestion_failure'
+
+        try:
+            content = read_latest_task_log(dag_run.dag_id, dag_run.run_id, task_name)
+            result = choose_next_action_from_log(content, strict=True)
+        except Exception as e:
+            ti.xcom_push(key='branch_success', value=False)
+            ti.xcom_push(key='failure_reason', value=str(e))
+            return 'record_ingestion_failure'
+
         # Airflow 3.x: Explicitly push XCom to ensure downstream tasks can detect success
         # BranchPythonOperator auto-push may not work reliably in Airflow 3.x SDK
-        ti = context['ti']
         ti.xcom_push(key='branch_success', value=True)
-        
+        ti.xcom_push(key='branch_decision', value=result)
         return result
 
     # Job task
@@ -942,7 +955,21 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
         task_id='check_result',
         python_callable=determine_next_action,
         dag=dag,
-        trigger_rule='all_success'  # Only run if all upstream tasks succeed - failures should fail the DAG
+        trigger_rule='all_done'  # Run even after pod failure so the DAG can finalize cleanly
+    )
+
+    def record_ingestion_failure(**context):
+        ti = context['ti']
+        reason = ti.xcom_pull(task_ids='check_result', key='failure_reason')
+        raise Exception(
+            "Ingestion job failed. Original pod/task logs remain on snapshot_merge_job. "
+            + f"Reason: {reason or 'unknown failure'}"
+        )
+
+    failure = PythonOperator(
+        task_id='record_ingestion_failure',
+        python_callable=record_ingestion_failure,
+        dag=dag
     )
 
     # Reschedule immediately
@@ -975,9 +1002,10 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
             return "Cleanup complete - DAG succeeded"
         
         # Branch didn't run or didn't push success marker - critical tasks must have failed
+        failure_reason = ti.xcom_pull(task_ids='check_result', key='failure_reason')
         raise Exception(
             "Ingestion DAG failed - snapshot_merge_job did not complete successfully. "
-            "Check task logs for details."
+            + f"Check task logs for details. Reason: {failure_reason or 'unknown failure'}"
         )
 
     # Airflow 3.x: This task runs after all others complete and checks for failures
@@ -992,8 +1020,8 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
     if sensor_task:
         sensor_task >> job
     job >> branch
-    branch >> [reschedule, wait]
-    [reschedule, wait] >> cleanup_task
+    branch >> [reschedule, wait, failure]
+    [reschedule, wait, failure] >> cleanup_task
 
     return dag
 
@@ -1281,6 +1309,26 @@ def read_latest_task_log(dag_id: str, run_id: str, task_id: str):
     except Exception:
         return None
     return None
+
+
+def _get_task_instance_state(dag_id: str, run_id: str, task_id: str):
+    """Return the current Airflow state for a task instance, or None if it is missing."""
+    try:
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.utils.session import create_session
+        with create_session() as session:
+            row = (
+                session.query(TaskInstance.state)
+                .filter(
+                    TaskInstance.dag_id == dag_id,
+                    TaskInstance.run_id == run_id,
+                    TaskInstance.task_id == task_id,
+                )
+                .one_or_none()
+            )
+            return row[0] if row else None
+    except Exception:
+        return None
 
 
 def choose_next_action_from_log(content, strict: bool):
@@ -1880,15 +1928,33 @@ def determine_next_action(**context):
     dag_id = context['dag'].dag_id
     run_id = context['dag_run'].run_id
     task_id_suffix = context.get('task_id_suffix', 'job')
-    task_id = f'datatransformer_{task_id_suffix}' if 'datatransformer' in dag_id else f'output_ingestion_{task_id_suffix}'
-    content = read_latest_task_log(dag_id, run_id, task_id)
-    result = choose_next_action_from_log(content, strict=True)
-    
+    result_task_id = context.get('result_task_id')
+    if not result_task_id:
+        result_task_id = f'datatransformer_{task_id_suffix}' if 'datatransformer' in dag_id else f'output_ingestion_{task_id_suffix}'
+    critical_task_ids = context.get('critical_task_ids') or [result_task_id]
+    failure_task_id = context.get('failure_task_id', 'record_datatransformer_failure')
+    ti = context['ti']
+
+    for critical_task_id in critical_task_ids:
+        task_state = _get_task_instance_state(dag_id, run_id, critical_task_id)
+        if task_state != 'success':
+            reason = f"{critical_task_id} finished in state {task_state or 'unknown'}"
+            ti.xcom_push(key='branch_success', value=False)
+            ti.xcom_push(key='failure_reason', value=reason)
+            return failure_task_id
+
+    try:
+        content = read_latest_task_log(dag_id, run_id, result_task_id)
+        result = choose_next_action_from_log(content, strict=True)
+    except Exception as e:
+        ti.xcom_push(key='branch_success', value=False)
+        ti.xcom_push(key='failure_reason', value=str(e))
+        return failure_task_id
+
     # Airflow 3.x: Explicitly push XCom to ensure downstream tasks can detect success
     # BranchPythonOperator auto-push may not work reliably in Airflow 3.x SDK
-    ti = context['ti']
     ti.xcom_push(key='branch_success', value=True)
-    
+    ti.xcom_push(key='branch_decision', value=result)
     return result
 
 def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_config: DataTransformerConfig) -> DAG:
@@ -2122,9 +2188,28 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
     branch = BranchPythonOperator(
         task_id='check_result',
         python_callable=determine_next_action,
-        op_kwargs={'task_id_suffix': 'job'},
+        op_kwargs={
+            'task_id_suffix': 'job',
+            'result_task_id': 'datatransformer_job',
+            'critical_task_ids': ['datatransformer_job', 'output_ingestion_job'],
+            'failure_task_id': 'record_datatransformer_failure',
+        },
         dag=dag,
-        trigger_rule='all_success'  # Only run if all upstream tasks succeed - failures should fail the DAG
+        trigger_rule='all_done'  # Run after pod failures so the DAG can finalize cleanly
+    )
+
+    def record_datatransformer_failure(**context):
+        ti = context['ti']
+        reason = ti.xcom_pull(task_ids='check_result', key='failure_reason')
+        raise Exception(
+            "DataTransformer DAG failed. Original pod/task logs remain on the failed task. "
+            + f"Reason: {reason or 'unknown failure'}"
+        )
+
+    failure = PythonOperator(
+        task_id='record_datatransformer_failure',
+        python_callable=record_datatransformer_failure,
+        dag=dag
     )
 
     # Cleanup task - check for failures and propagate to fail the DAG run
@@ -2143,9 +2228,10 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
             return "Cleanup complete - DAG succeeded"
         
         # Branch didn't run or didn't push success marker - critical tasks must have failed
+        failure_reason = ti.xcom_pull(task_ids='check_result', key='failure_reason')
         raise Exception(
             "DataTransformer DAG failed - critical tasks (datatransformer_job or output_ingestion_job) "
-            "did not complete successfully. Check task logs for details."
+            + f"did not complete successfully. Check task logs for details. Reason: {failure_reason or 'unknown failure'}"
         )
 
     # Airflow 3.x: provide_context removed - context always provided
@@ -2183,8 +2269,8 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
     # - branch runs after both complete (either success path or failure path)
     datatransformer_job >> output_ingestion_job
     [datatransformer_job, output_ingestion_job] >> branch
-    branch >> [reschedule, wait]
-    [reschedule, wait] >> cleanup_batch_id
+    branch >> [reschedule, wait, failure]
+    [reschedule, wait, failure] >> cleanup_batch_id
 
     return dag
 
