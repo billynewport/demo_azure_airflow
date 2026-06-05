@@ -868,19 +868,20 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
         task_name = "output_ingestion_job" if "_dt_ingestion" in dag_run.dag_id else "snapshot_merge_job"
         ti = context['ti']
 
-        task_state = _get_task_instance_state(dag_run.dag_id, dag_run.run_id, task_name)
-        if task_state != 'success':
-            reason = f"{task_name} finished in state {task_state or 'unknown'}"
-            ti.xcom_push(key='branch_success', value=False)
-            ti.xcom_push(key='failure_reason', value=reason)
-            return 'record_ingestion_failure'
-
         try:
             content = read_latest_task_log(dag_run.dag_id, dag_run.run_id, task_name)
             result = choose_next_action_from_log(content, strict=True)
         except Exception as e:
+            task_state = _get_task_instance_state(dag_run.dag_id, dag_run.run_id, task_name)
+            if task_state == 'success':
+                reason = f"{task_name} succeeded but result marker could not be parsed: {e}"
+            else:
+                reason = (
+                    f"{task_name} finished in state {task_state or 'unknown'}; "
+                    + f"result marker could not be parsed: {e}"
+                )
             ti.xcom_push(key='branch_success', value=False)
-            ti.xcom_push(key='failure_reason', value=str(e))
+            ti.xcom_push(key='failure_reason', value=reason)
             return 'record_ingestion_failure'
 
         # Airflow 3.x: Explicitly push XCom to ensure downstream tasks can detect success
