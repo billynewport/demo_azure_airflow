@@ -1021,7 +1021,7 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
         sensor_task >> job
     job >> branch
     branch >> [reschedule, wait, failure]
-    [reschedule, wait, failure] >> cleanup_task
+    [reschedule, wait] >> cleanup_task
 
     return dag
 
@@ -2270,7 +2270,7 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
     datatransformer_job >> output_ingestion_job
     [datatransformer_job, output_ingestion_job] >> branch
     branch >> [reschedule, wait, failure]
-    [reschedule, wait, failure] >> cleanup_batch_id
+    [reschedule, wait] >> cleanup_batch_id
 
     return dag
 
