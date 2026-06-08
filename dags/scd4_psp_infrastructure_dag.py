@@ -1,5 +1,5 @@
 """
-Infrastructure DAG for Demo_PSP Data Platform
+Infrastructure DAG for SCD4_PSP Data Platform
 Generated automatically by DataSurface Yellow Airflow 3.x Platform
 
 This DAG contains the core infrastructure tasks:
@@ -554,13 +554,13 @@ default_args = {
 
 # Create the DAG
 dag = DAG(
-    'demo-psp_infrastructure',
+    'scd4-psp_infrastructure',
     default_args=default_args,
-    description='Infrastructure DAG for demo-psp Data Platform',
+    description='Infrastructure DAG for scd4-psp Data Platform',
     schedule='*/5 * * * *',  # Run every 5 minutes to pick up model changes quickly
     catchup=False,
     max_active_runs=1,
-    tags=['datasurface', 'infrastructure', 'demo-psp'],
+    tags=['datasurface', 'infrastructure', 'scd4-psp'],
     is_paused_upon_creation=False  # Start unpaused so DAG is immediately active
 )
 
@@ -575,7 +575,7 @@ start_task = EmptyOperator(
 # Environment variables for the model merge task.
 model_merge_env_vars = [
     # Platform configuration (literal values)
-    k8s.V1EnvVar(name='DATASURFACE_PSP_NAME', value='demo-psp'),
+    k8s.V1EnvVar(name='DATASURFACE_PSP_NAME', value='scd4-psp'),
     k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value='ds-scale'),
 ]
 
@@ -600,9 +600,9 @@ model_merge_env_vars.extend(build_otlp_env_vars({
 # MERGE Task - Generates infrastructure terraform files using model merge handler
 merge_task = KubernetesPodOperator(
     task_id='infrastructure_merge_task',
-    name='demo-psp-infra-merge',
+    name='scd4-psp-infra-merge',
     namespace='ds-scale',
-    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.35',
+    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.39',
     cmds=['/bin/bash'],
     arguments=[
         '-c',
@@ -629,7 +629,7 @@ merge_task = KubernetesPodOperator(
           --rte-name "demo" \\
           --max-cache-age-minutes "5" \\
           --output "/workspace/generated_artifacts" \\
-          --psp "Demo_PSP" 2>&1; then
+          --psp "SCD4_PSP" 2>&1; then
             echo "✅ Infrastructure model merge handler complete!"
         else
             echo ""
@@ -1497,7 +1497,7 @@ def _create_single_ingestion_dag(dag_id: str, platform: str) -> Optional[DAG]:
         
         try:
             # Query for the platform's factory config to get the ingestion table name
-            factory_table_name = 'demo_psp_factory_dags'
+            factory_table_name = 'scd4_psp_factory_dags'
             factory_dag_id = f"{platform}_factory_dag"
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
@@ -1549,7 +1549,7 @@ def _create_single_datatransformer_dag(dag_id: str, platform: str) -> Optional[D
         
         try:
             # Query for the platform's factory config to get the datatransformer table name
-            factory_table_name = 'demo_psp_factory_dags'
+            factory_table_name = 'scd4_psp_factory_dags'
             factory_dag_id = f"{platform}_datatransformer_factory"
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
@@ -1601,7 +1601,7 @@ def _create_single_cqrs_dag(dag_id: str) -> Optional[DAG]:
 
         try:
             # Direct lookup by dag_id (O(1) indexed lookup)
-            cqrs_table_name = 'demo_psp_cqrs_dags'
+            cqrs_table_name = 'scd4_psp_cqrs_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT config_json FROM {cqrs_table_name}
@@ -1637,7 +1637,7 @@ def _create_single_factory_dag(dag_id: str) -> Optional[DAG]:
             return None
         
         try:
-            factory_table_name = 'demo_psp_factory_dags'
+            factory_table_name = 'scd4_psp_factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT config_json FROM {factory_table_name}
@@ -1673,7 +1673,7 @@ def _create_single_dt_factory_dag(dag_id: str) -> Optional[DAG]:
             return None
         
         try:
-            factory_table_name = 'demo_psp_factory_dags'
+            factory_table_name = 'scd4_psp_factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT config_json FROM {factory_table_name}
@@ -2653,7 +2653,7 @@ def create_cqrs_execution_dag(config: dict) -> DAG:
             '--max-cache-age-minutes', str(config.get('git_cache_max_age_minutes', 5)),
             '--worker-id', str(worker_id),
             '--num-workers', str(max_workers)
-        ] + (['--git-release-selector', config['git_release_selector']] if config.get('git_release_selector') else []) \
+        ] + (['--git-release-selector-hex', config['git_release_selector']] if config.get('git_release_selector') else []) \
           + (['--use-git-cache'] if config.get('git_cache_enabled') else []),
         env_vars=env_vars,
         image_pull_policy='IfNotPresent',
@@ -2699,7 +2699,7 @@ def load_cqrs_configurations() -> dict:
             # Read from the PSP-specific CQRS table using template parameter
             # dag_id is now the primary key for direct lookup
             # Shard filter ensures each DAG file only loads its assigned DAGs
-            cqrs_table_name = 'demo_psp_cqrs_dags'
+            cqrs_table_name = 'scd4_psp_cqrs_dags'
             rows = fetch_rows(engine, f"""
                 SELECT dag_id, config_json
                 FROM {cqrs_table_name}
@@ -2754,7 +2754,7 @@ def load_dc_reconcile_configurations() -> dict:
             # Read from the PSP-specific DC reconcile table
             # dag_id is now the primary key for direct lookup
             # Shard filter ensures each DAG file only loads its assigned DAGs
-            dc_reconcile_table_name = 'demo_psp_dc_reconcile_dags'
+            dc_reconcile_table_name = 'scd4_psp_dc_reconcile_dags'
             rows = fetch_rows(engine, f"""
                 SELECT dag_id, config_json
                 FROM {dc_reconcile_table_name}
@@ -2894,7 +2894,7 @@ def create_factory_dags_from_database(silent: bool = False, **context):
             # Read factory DAG configurations - table created/populated by handleModelMerge
             # dag_id is now the primary key for direct lookup
             # Shard filter ensures each DAG file only loads its assigned factory DAGs
-            factory_table_name = 'demo_psp_factory_dags'
+            factory_table_name = 'scd4_psp_factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT dag_id, config_json
