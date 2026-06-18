@@ -1,5 +1,5 @@
 """
-Infrastructure DAG for SCD4_PSP Data Platform
+Infrastructure DAG for AzureSnowflake_PSP Data Platform
 Generated automatically by DataSurface Yellow Airflow 3.x Platform
 
 This DAG contains the core infrastructure tasks:
@@ -34,7 +34,7 @@ import urllib.request
 import urllib.error
 from kubernetes import client, config
 from kubernetes.client import models as k8s
-from typing import Optional, Union, TypedDict, NotRequired, List, Dict
+from typing import Optional, Union, TypedDict, NotRequired, List, Dict, Any
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from abc import ABC, abstractmethod
@@ -442,7 +442,7 @@ class K8sSecretManager(SecretManager):
 
         return ca_cert
 
-secret_manager = K8sSecretManager(namespace='ds-scale')
+secret_manager = K8sSecretManager(namespace='ds-scale-azure-sf')
 
 def build_otlp_env_vars(config: Dict, default_port: int = 4318) -> List[k8s.V1EnvVar]:
     """Build OpenTelemetry OTLP environment variables for node-local agent access.
@@ -451,7 +451,7 @@ def build_otlp_env_vars(config: Dict, default_port: int = 4318) -> List[k8s.V1En
     DaemonSet-based telemetry agents (like Datadog) running on the same node.
     
     Args:
-        config: Configuration dict that may contain 'otlp_enabled', 'otlp_port', 'otlp_protocol'
+        config: Configuration dict that may contain 'otlp_enabled', 'otlp_port', 'otlp_protocol', 'otlp_profile'
         default_port: Default OTLP port if not specified (default: 4318)
         
     Returns:
@@ -476,7 +476,12 @@ def build_otlp_env_vars(config: Dict, default_port: int = 4318) -> List[k8s.V1En
     # Add protocol if specified
     if config.get('otlp_protocol'):
         env_vars.append(k8s.V1EnvVar(name='OTEL_EXPORTER_OTLP_PROTOCOL', value=config['otlp_protocol']))
-    
+
+    # Profile is model-sourced; the SDK reads it to decide resource-attribute inclusion.
+    env_vars.append(
+        k8s.V1EnvVar(name='DATASURFACE_OTLP_PROFILE', value=config.get('otlp_profile', 'prometheus'))
+    )
+
     return env_vars
 
 # Strongly-typed configs for better readability and tooling
@@ -489,7 +494,7 @@ class PlatformConfig(TypedDict):
     merge_db_credential_secret_type: str
     merge_db_driver: str
     merge_db_hostname: str
-    merge_db_port: int
+    merge_db_port: Optional[int]
     merge_db_database: str
     merge_db_query: NotRequired[str]
     git_credential_secret_name: str
@@ -503,11 +508,17 @@ class PlatformConfig(TypedDict):
     git_cache_max_age_minutes: int
     git_cache_enabled: NotRequired[bool]
     rte_name: NotRequired[str]
+    control_schema_name: NotRequired[str]
     phys_dag_table_name: str
+    phys_dag_table_schema_name: NotRequired[str]
+    phys_dag_table_object_name: NotRequired[str]
     phys_datatransformer_table_name: str
+    phys_datatransformer_table_schema_name: NotRequired[str]
+    phys_datatransformer_table_object_name: NotRequired[str]
     otlp_enabled: NotRequired[bool]
     otlp_port: NotRequired[int]
     otlp_protocol: NotRequired[str]
+    otlp_profile: NotRequired[str]
 
 
 class StreamConfig(TypedDict):
@@ -554,13 +565,13 @@ default_args = {
 
 # Create the DAG
 dag = DAG(
-    'scd4-psp_infrastructure',
+    'azuresnowflake-psp_infrastructure',
     default_args=default_args,
-    description='Infrastructure DAG for scd4-psp Data Platform',
+    description='Infrastructure DAG for azuresnowflake-psp Data Platform',
     schedule='*/5 * * * *',  # Run every 5 minutes to pick up model changes quickly
     catchup=False,
     max_active_runs=1,
-    tags=['datasurface', 'infrastructure', 'scd4-psp'],
+    tags=['datasurface', 'infrastructure', 'azuresnowflake-psp'],
     is_paused_upon_creation=False  # Start unpaused so DAG is immediately active
 )
 
@@ -575,14 +586,14 @@ start_task = EmptyOperator(
 # Environment variables for the model merge task.
 model_merge_env_vars = [
     # Platform configuration (literal values)
-    k8s.V1EnvVar(name='DATASURFACE_PSP_NAME', value='scd4-psp'),
-    k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value='ds-scale'),
+    k8s.V1EnvVar(name='DATASURFACE_PSP_NAME', value='azuresnowflake-psp'),
+    k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value='ds-scale-azure-sf'),
 ]
 
 # Model merge needs only the merge database and model Git credentials.
 model_merge_env_vars.extend(secret_manager.getCredential(
-    'sqlserver-demo-merge',
-    'USER_PASSWORD'
+    'snowflake-runtime',
+    'PRIVATE_KEY_AUTH'
 ))
 model_merge_env_vars.extend(secret_manager.getCredential(
     'git',
@@ -591,18 +602,19 @@ model_merge_env_vars.extend(secret_manager.getCredential(
 
 # OpenTelemetry OTLP configuration for node-local agent access
 model_merge_env_vars.extend(build_otlp_env_vars({
-    'otlp_enabled': True,
+    'otlp_enabled': False,
     'otlp_port': 4318,
-    'otlp_protocol': 'http/protobuf',
+    
+    'otlp_profile': 'prometheus',
 }))
 
 
 # MERGE Task - Generates infrastructure terraform files using model merge handler
 merge_task = KubernetesPodOperator(
     task_id='infrastructure_merge_task',
-    name='scd4-psp-infra-merge',
-    namespace='ds-scale',
-    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.43',
+    name='azuresnowflake-psp-infra-merge',
+    namespace='ds-scale-azure-sf',
+    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.65',
     cmds=['/bin/bash'],
     arguments=[
         '-c',
@@ -620,16 +632,16 @@ merge_task = KubernetesPodOperator(
           --git-repo-path "/cache/git-cache" \\
           --git-repo-type "github" \\
           --git-repo-url "https://github.com" \\
-          --git-repo-owner "billynewport" \\
-          --git-repo-name "demo_azure_model" \\
+          --git-repo-owner "datasurface" \\
+          --git-repo-name "demo_large_test" \\
           --git-repo-branch "main" \\
           --git-platform-repo-credential-name "git" \\
           --git-release-selector-hex 7b2274797065223a202256657273696f6e5061747465726e52656c6561736553656c6563746f72222c202276657273696f6e5061747465726e223a2022765b302d395d2b5c5c2e5b302d395d2b5c5c2e5b302d395d2b2d64656d6f222c202272656c6561736554797065223a2022737461626c655f6f6e6c79227d \\
           --use-git-cache \\
-          --rte-name "demo" \\
+          --rte-name "azure_sf" \\
           --max-cache-age-minutes "5" \\
           --output "/workspace/generated_artifacts" \\
-          --psp "SCD4_PSP" 2>&1; then
+          --psp "AzureSnowflake_PSP" 2>&1; then
             echo "✅ Infrastructure model merge handler complete!"
         else
             echo ""
@@ -902,7 +914,7 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
         '--git-repo-name', platform_config['git_repo_repo_name'],
         '--git-repo-branch', platform_config['git_repo_branch'],
         '--git-platform-repo-credential-name', platform_config['git_credential_name'],
-        '--rte-name', 'demo',
+        '--rte-name', 'azure_sf',
         '--max-cache-age-minutes', str(platform_config['git_cache_max_age_minutes'])  # Cache freshness threshold
     ]
 
@@ -1029,31 +1041,94 @@ def create_ingestion_stream_dag(platform_config: PlatformConfig, stream_config: 
 
     return dag
 
-def create_database_connection(driver: str, user: str, password: str, host: str, port: int, database: str, query_driver: Optional[str] = None):
+def _parse_query_params(query_driver: Optional[Union[str, Dict[str, str]]]) -> Optional[Dict[str, str]]:
+    if query_driver in (None, '', 'None'):
+        return None
+    if isinstance(query_driver, dict):
+        return query_driver
+    try:
+        parsed = json.loads(query_driver)
+    except Exception:
+        return {"driver": query_driver}
+    return parsed if isinstance(parsed, dict) else {"driver": query_driver}
+
+
+def _private_key_connect_args(private_key_content: str, passphrase: str) -> Dict[str, Any]:
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
+
+    private_key = serialization.load_pem_private_key(
+        private_key_content.encode('utf-8'),
+        password=passphrase.encode('utf-8') if passphrase else None,
+        backend=default_backend(),
+    )
+    private_key_der = private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return {"private_key": private_key_der}
+
+
+def create_database_connection(
+    driver: str,
+    user: str,
+    password: Optional[str],
+    host: str,
+    port: Optional[int],
+    database: str,
+    query_driver: Optional[Union[str, Dict[str, str]]] = None,
+    connect_args: Optional[Dict[str, Any]] = None,
+):
     """Helper function to create database connection URL and engine consistently"""
     # Build common URL parameters
     url_params = {
         "drivername": driver,
         "username": user,
-        "password": password,
         "host": host,
-        "port": port,
         "database": database,
     }
+    if password is not None:
+        url_params["password"] = password
+    if port is not None:
+        url_params["port"] = port
 
     # Add query parameters if needed
-    if query_driver:
-        url_params["query"] = {"driver": query_driver}
+    query_params = _parse_query_params(query_driver)
+    if query_params:
+        url_params["query"] = query_params
 
     db_url = URL.create(**url_params)
-    return create_engine(db_url)
+    engine_kwargs = {"connect_args": connect_args} if connect_args else {}
+    return create_engine(db_url, **engine_kwargs)
 
 
-def fetch_rows(engine, sql: str):
-    """Read rows using a simple text SQL statement within a transaction."""
-    with engine.begin() as connection:
-        result = connection.execute(text(sql))
-        return list(result.fetchall())
+def fetch_rows(engine, sql: str, attempts: int = 3, backoff_seconds: float = 2.0):
+    """Read rows using a simple text SQL statement within a transaction.
+
+    Retries on transient failures (e.g. login/connect timeout when the merge DB gateway is busy
+    under high ingestion concurrency). Without this, a single read timeout surfaces as an empty
+    config set, which makes the factory remove every dynamic DAG (drop to 1) until the next run
+    reconnects. Re-raises after exhausting attempts so callers preserve the existing DAGs rather
+    than treating a failed read as 'no active configs'.
+    """
+    import time as _time
+    if attempts < 1:
+        # Guard the degenerate case: with attempts < 1 the loop never runs and `raise last_exc`
+        # would `raise None` -> TypeError, masking the real misconfiguration.
+        raise ValueError(f"fetch_rows requires attempts >= 1, got {attempts}")
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with engine.begin() as connection:
+                result = connection.execute(text(sql))
+                return list(result.fetchall())
+        except Exception as e:
+            last_exc = e
+            _logger.warning(f"fetch_rows attempt {attempt}/{attempts} failed: {e}")
+            if attempt < attempts:
+                _time.sleep(backoff_seconds * attempt)
+    raise last_exc
 
 
 def map_rows_to_dags(rows, row_to_id_and_dag):
@@ -1115,24 +1190,23 @@ def sync_dag_lifecycle(existing_dags: dict, desired_dags: dict, logger):
 def build_merge_engine_from_env(config: PlatformConfig):
     """Create a DB engine from merge config using secret_manager. Returns engine or None if creds missing."""
     try:
-        user, password = secret_manager.getUserPassword(config['merge_db_credential_secret_name'])
+        return build_merge_engine_from_env_template(
+            credential_secret_name=config['merge_db_credential_secret_name'],
+            credential_secret_type=config['merge_db_credential_secret_type'],
+            driver=config['merge_db_driver'],
+            host=config['merge_db_hostname'],
+            port=config['merge_db_port'],
+            database=config['merge_db_database'],
+            query_driver=config.get('merge_db_query', None)
+        )
     except Exception:
         return None
-    return create_database_connection(
-        driver=config['merge_db_driver'],
-        user=user,
-        password=password,
-        host=config['merge_db_hostname'],
-        port=config['merge_db_port'],
-        database=config['merge_db_database'],
-        query_driver=config.get('merge_db_query', None)
-    )
 
 
-def build_merge_engine_from_env_template(credential_secret_name: str, credential_secret_type: str, driver: str, host: str, port: int, database: str, query_driver):
+def build_merge_engine_from_env_template(credential_secret_name: str, credential_secret_type: str, driver: str, host: str, port: Optional[int], database: str, query_driver):
     """Top-level helper for template-driven params. Builds and returns a SQLAlchemy engine.
     Raises Exception on failure or unsupported credential type.
-    Supported types: USER_PASSWORD.
+    Supported types: USER_PASSWORD, PRIVATE_KEY_AUTH.
     """
     # Normalize query_driver coming from template (could be 'None' string)
     qd = None if (query_driver in (None, '', 'None')) else query_driver
@@ -1146,6 +1220,18 @@ def build_merge_engine_from_env_template(credential_secret_name: str, credential
             port=port,
             database=database,
             query_driver=qd
+        )
+    if credential_secret_type == 'PRIVATE_KEY_AUTH':
+        user, private_key, passphrase = secret_manager.getPrivateKeyAuth(credential_secret_name)
+        return create_database_connection(
+            driver=driver,
+            user=user,
+            password=None,
+            host=host,
+            port=port,
+            database=database,
+            query_driver=qd,
+            connect_args=_private_key_connect_args(private_key, passphrase)
         )
     # API_TOKEN and API_KEY_PAIR are not applicable for SQLAlchemy DB auth here
     raise Exception(f"Unsupported credential type for merge DB engine: {credential_secret_type}")
@@ -1484,20 +1570,20 @@ def _create_single_ingestion_dag(dag_id: str, platform: str) -> Optional[DAG]:
     """Create a single ingestion DAG by querying just that record from the database using dag_id as PK."""
     try:
         engine = build_merge_engine_from_env_template(
-            credential_secret_name='sqlserver-demo-merge',
-            credential_secret_type='USER_PASSWORD',
-            driver='mssql+pyodbc',
-            host='ds-scale-merge-06030935-f006.database.windows.net',
-            port=1433,
-            database='merge_db',
-            query_driver='ODBC Driver 18 for SQL Server'
+            credential_secret_name='snowflake-runtime',
+            credential_secret_type='PRIVATE_KEY_AUTH',
+            driver='snowflake',
+            host='HORSEQD-DATASURFACE_AZURE_SF',
+            port=None,
+            database='DATASURFACE_SCALE',
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
         
         try:
             # Query for the platform's factory config to get the ingestion table name
-            factory_table_name = 'scd4_psp_factory_dags'
+            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
             factory_dag_id = f"{platform}_factory_dag"
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
@@ -1536,20 +1622,20 @@ def _create_single_datatransformer_dag(dag_id: str, platform: str) -> Optional[D
     """Create a single datatransformer DAG by querying just that record from the database using dag_id as PK."""
     try:
         engine = build_merge_engine_from_env_template(
-            credential_secret_name='sqlserver-demo-merge',
-            credential_secret_type='USER_PASSWORD',
-            driver='mssql+pyodbc',
-            host='ds-scale-merge-06030935-f006.database.windows.net',
-            port=1433,
-            database='merge_db',
-            query_driver='ODBC Driver 18 for SQL Server'
+            credential_secret_name='snowflake-runtime',
+            credential_secret_type='PRIVATE_KEY_AUTH',
+            driver='snowflake',
+            host='HORSEQD-DATASURFACE_AZURE_SF',
+            port=None,
+            database='DATASURFACE_SCALE',
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
         
         try:
             # Query for the platform's factory config to get the datatransformer table name
-            factory_table_name = 'scd4_psp_factory_dags'
+            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
             factory_dag_id = f"{platform}_datatransformer_factory"
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
@@ -1588,20 +1674,20 @@ def _create_single_cqrs_dag(dag_id: str) -> Optional[DAG]:
     """Create a single CQRS DAG by direct lookup using dag_id as primary key."""
     try:
         engine = build_merge_engine_from_env_template(
-            credential_secret_name='sqlserver-demo-merge',
-            credential_secret_type='USER_PASSWORD',
-            driver='mssql+pyodbc',
-            host='ds-scale-merge-06030935-f006.database.windows.net',
-            port=1433,
-            database='merge_db',
-            query_driver='ODBC Driver 18 for SQL Server'
+            credential_secret_name='snowflake-runtime',
+            credential_secret_type='PRIVATE_KEY_AUTH',
+            driver='snowflake',
+            host='HORSEQD-DATASURFACE_AZURE_SF',
+            port=None,
+            database='DATASURFACE_SCALE',
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
 
         try:
             # Direct lookup by dag_id (O(1) indexed lookup)
-            cqrs_table_name = 'scd4_psp_cqrs_dags'
+            cqrs_table_name = 'ds_ctl_azuresnowflake_psp.cqrs_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT config_json FROM {cqrs_table_name}
@@ -1625,19 +1711,19 @@ def _create_single_factory_dag(dag_id: str) -> Optional[DAG]:
     """Create a single platform factory DAG by querying just that record from the database using dag_id as PK."""
     try:
         engine = build_merge_engine_from_env_template(
-            credential_secret_name='sqlserver-demo-merge',
-            credential_secret_type='USER_PASSWORD',
-            driver='mssql+pyodbc',
-            host='ds-scale-merge-06030935-f006.database.windows.net',
-            port=1433,
-            database='merge_db',
-            query_driver='ODBC Driver 18 for SQL Server'
+            credential_secret_name='snowflake-runtime',
+            credential_secret_type='PRIVATE_KEY_AUTH',
+            driver='snowflake',
+            host='HORSEQD-DATASURFACE_AZURE_SF',
+            port=None,
+            database='DATASURFACE_SCALE',
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
         
         try:
-            factory_table_name = 'scd4_psp_factory_dags'
+            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT config_json FROM {factory_table_name}
@@ -1661,19 +1747,19 @@ def _create_single_dt_factory_dag(dag_id: str) -> Optional[DAG]:
     """Create a single datatransformer factory DAG by querying just that record from the database using dag_id as PK."""
     try:
         engine = build_merge_engine_from_env_template(
-            credential_secret_name='sqlserver-demo-merge',
-            credential_secret_type='USER_PASSWORD',
-            driver='mssql+pyodbc',
-            host='ds-scale-merge-06030935-f006.database.windows.net',
-            port=1433,
-            database='merge_db',
-            query_driver='ODBC Driver 18 for SQL Server'
+            credential_secret_name='snowflake-runtime',
+            credential_secret_type='PRIVATE_KEY_AUTH',
+            driver='snowflake',
+            host='HORSEQD-DATASURFACE_AZURE_SF',
+            port=None,
+            database='DATASURFACE_SCALE',
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
         
         try:
-            factory_table_name = 'scd4_psp_factory_dags'
+            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT config_json FROM {factory_table_name}
@@ -1783,8 +1869,11 @@ def load_platform_configurations(config: PlatformConfig):
         engine = build_merge_engine_from_env(config)
         if engine is None:
             expected_user, expected_pwd = get_merge_env_names(config)
-            print(f"Missing Merge SQL credentials in environment variables: {expected_user}, {expected_pwd}")
-            return {}
+            # Do NOT return {} here: an empty desired set makes sync_dag_lifecycle remove every
+            # dynamic DAG (drop to 1). Raise instead so the enclosing handler re-raises and the
+            # sync is skipped, preserving existing DAGs until creds reappear — same contract as a
+            # transient read failure. Only a successful read of 0 active rows legitimately yields {}.
+            raise RuntimeError(f"Missing Merge SQL credentials in environment variables: {expected_user}, {expected_pwd}")
 
         try:
             # Read from the platform-specific airflow_dsg table
@@ -1812,8 +1901,13 @@ def load_platform_configurations(config: PlatformConfig):
         generated_dags.update(desired)
 
     except Exception as e:
+        # Do NOT collapse to an empty config on failure: an empty result makes the factory remove
+        # every dynamic DAG (drop to 1). Re-raise so the sync is skipped and existing DAGs are
+        # preserved until the next run reconnects. A genuine empty config (read OK, 0 active rows)
+        # returns {} via the normal path below and is intentional.
         print(f"Error loading platform configurations: {e}")
-        return {}
+        _logger.error(f"Error loading platform configurations: {e}")
+        raise
 
     return generated_dags
 
@@ -1920,7 +2014,12 @@ def create_platform_factory_dag(config: PlatformConfig) -> DAG:
         for dag_id, dag_object in initial_dags.items():
             globals()[dag_id] = dag_object
     except Exception as e:
+        # Re-raise so the DAG-file parse FAILS on a transient read error. Airflow then retains the
+        # previously-parsed DAGs (full set) rather than registering a successful-but-empty parse
+        # that drops everything to just the factory DAG. load_* only raises on real read failures.
         print(f"Warning: Failed to load initial dynamic DAGs during discovery: {e}")
+        _logger.error(f"Failed to load initial dynamic DAGs during discovery: {e}")
+        raise
 
     return factory_dag
 
@@ -1942,6 +2041,15 @@ def determine_next_action(**context):
     for critical_task_id in critical_task_ids:
         task_state = _get_task_instance_state(dag_id, run_id, critical_task_id)
         if task_state != 'success':
+            if task_state is None:
+                try:
+                    # Airflow 3 can expose a transient None state inside this branch task even
+                    # after the worker task has emitted its authoritative next-action log line.
+                    critical_log = read_latest_task_log(dag_id, run_id, critical_task_id)
+                    choose_next_action_from_log(critical_log, strict=True)
+                    continue
+                except Exception:
+                    pass
             reason = f"{critical_task_id} finished in state {task_state or 'unknown'}"
             ti.xcom_push(key='branch_success', value=False)
             ti.xcom_push(key='failure_reason', value=reason)
@@ -2122,7 +2230,7 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
             '--git-repo-name', platform_config['git_repo_repo_name'],
             '--git-repo-branch', platform_config['git_repo_branch'],
             '--git-platform-repo-credential-name', platform_config['git_credential_name'],
-            '--rte-name', 'demo',
+            '--rte-name', 'azure_sf',
             '--max-cache-age-minutes', str(platform_config['git_cache_max_age_minutes'])  # Cache freshness threshold
         ] + (['--git-release-selector-hex', platform_config['git_release_selector']] if platform_config.get('git_release_selector') else []) \
           + (['--use-git-cache'] if platform_config.get('git_cache_enabled') else []),
@@ -2169,7 +2277,7 @@ def create_datatransformer_execution_dag(platform_config: PlatformConfig, dt_con
             '--git-repo-name', platform_config['git_repo_repo_name'],
             '--git-repo-branch', platform_config['git_repo_branch'],
             '--git-platform-repo-credential-name', platform_config['git_credential_name'],
-            '--rte-name', 'demo',
+            '--rte-name', 'azure_sf',
             '--max-cache-age-minutes', str(platform_config['git_cache_max_age_minutes'])  # Cache freshness threshold
         ] + (['--git-release-selector-hex', platform_config['git_release_selector']] if platform_config.get('git_release_selector') else []) \
           + (['--use-git-cache'] if platform_config.get('git_cache_enabled') else []),
@@ -2291,8 +2399,11 @@ def load_datatransformer_configurations(config: PlatformConfig):
         engine = build_merge_engine_from_env(config)
         if engine is None:
             expected_user, expected_pwd = get_merge_env_names(config)
-            print(f"Missing Merge SQL credentials in environment variables: {expected_user}, {expected_pwd}")
-            return {}
+            # Do NOT return {} here: an empty desired set makes sync_dag_lifecycle remove every
+            # dynamic DAG (drop to 1). Raise instead so the enclosing handler re-raises and the
+            # sync is skipped, preserving existing DAGs until creds reappear — same contract as a
+            # transient read failure. Only a successful read of 0 active rows legitimately yields {}.
+            raise RuntimeError(f"Missing Merge SQL credentials in environment variables: {expected_user}, {expected_pwd}")
 
         try:
             # Read from the platform-specific airflow_datatransformer table
@@ -2334,8 +2445,11 @@ def load_datatransformer_configurations(config: PlatformConfig):
         return generated_dags
 
     except Exception as e:
+        # Re-raise (don't collapse to {}) so a transient read failure preserves existing DAGs
+        # instead of removing them. See fetch_rows / load_platform_configurations.
         print(f"Error loading DataTransformer configurations: {e}")
-        return {}
+        _logger.error(f"Error loading DataTransformer configurations: {e}")
+        raise
 
 def sync_datatransformer_dags(config: PlatformConfig, **context):
     """Synchronize dynamic DataTransformer DAGs with database configuration - identical to original template"""
@@ -2435,7 +2549,10 @@ def create_datatransformer_factory_dag(config: PlatformConfig) -> DAG:
         for dag_id, dag_object in initial_dags.items():
             globals()[dag_id] = dag_object
     except Exception as e:
+        # Re-raise so the parse fails and Airflow retains the prior DAGs (see ingestion discovery).
         print(f"Warning: Failed to load initial DataTransformer DAGs during discovery: {e}")
+        _logger.error(f"Failed to load initial DataTransformer DAGs during discovery: {e}")
+        raise
 
     return factory_dag
 
@@ -2523,7 +2640,7 @@ def create_dc_reconcile_dag(config: dict) -> DAG:
             '--git-repo-name', config['git_repo_repo_name'],
             '--git-repo-branch', config['git_repo_branch'],
             '--git-platform-repo-credential-name', config['git_credential_name'],
-            '--rte-name', 'demo',
+            '--rte-name', 'azure_sf',
             '--max-cache-age-minutes', str(config.get('git_cache_max_age_minutes', 5))
         ] + (['--git-release-selector-hex', config['git_release_selector']] if config.get('git_release_selector') else []) \
           + (['--use-git-cache'] if config.get('git_cache_enabled') else []),
@@ -2649,7 +2766,7 @@ def create_cqrs_execution_dag(config: dict) -> DAG:
             '--git-repo-name', config['git_repo_repo_name'],
             '--git-repo-branch', config['git_repo_branch'],
             '--git-platform-repo-credential-name', config['git_credential_name'],
-            '--rte-name', 'demo',
+            '--rte-name', 'azure_sf',
             '--max-cache-age-minutes', str(config.get('git_cache_max_age_minutes', 5)),
             '--worker-id', str(worker_id),
             '--num-workers', str(max_workers)
@@ -2682,24 +2799,27 @@ def load_cqrs_configurations() -> dict:
         
         # Create database connection using helper
         engine = build_merge_engine_from_env_template(
-            credential_secret_name='sqlserver-demo-merge',
-            credential_secret_type='USER_PASSWORD',
-            driver='mssql+pyodbc',
-            host='ds-scale-merge-06030935-f006.database.windows.net',
-            port=1433,
-            database='merge_db',
-            query_driver='ODBC Driver 18 for SQL Server'
+            credential_secret_name='snowflake-runtime',
+            credential_secret_type='PRIVATE_KEY_AUTH',
+            driver='snowflake',
+            host='HORSEQD-DATASURFACE_AZURE_SF',
+            port=None,
+            database='DATASURFACE_SCALE',
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
-            expected_user, expected_pwd = get_merge_env_names_template('sqlserver-demo-merge')
-            print(f"Missing Merge SQL credentials in environment variables: {expected_user}, {expected_pwd}")
-            return {}
+            expected_user, expected_pwd = get_merge_env_names_template('snowflake-runtime')
+            # Do NOT return {} here: an empty desired set makes sync_dag_lifecycle remove every
+            # dynamic DAG (drop to 1). Raise instead so the enclosing handler re-raises and the
+            # sync is skipped, preserving existing DAGs until creds reappear — same contract as a
+            # transient read failure. Only a successful read of 0 active rows legitimately yields {}.
+            raise RuntimeError(f"Missing Merge SQL credentials in environment variables: {expected_user}, {expected_pwd}")
         
         try:
             # Read from the PSP-specific CQRS table using template parameter
             # dag_id is now the primary key for direct lookup
             # Shard filter ensures each DAG file only loads its assigned DAGs
-            cqrs_table_name = 'scd4_psp_cqrs_dags'
+            cqrs_table_name = 'ds_ctl_azuresnowflake_psp.cqrs_dags'
             rows = fetch_rows(engine, f"""
                 SELECT dag_id, config_json
                 FROM {cqrs_table_name}
@@ -2721,8 +2841,11 @@ def load_cqrs_configurations() -> dict:
         generated_dags.update(desired)
         
     except Exception as e:
+        # Re-raise (don't collapse to {}) so a transient read failure preserves existing DAGs
+        # instead of removing them. See fetch_rows / load_platform_configurations.
         print(f"Error loading CQRS configurations: {e}")
-        return {}
+        _logger.error(f"Error loading CQRS configurations: {e}")
+        raise
     
     return generated_dags
 
@@ -2737,24 +2860,27 @@ def load_dc_reconcile_configurations() -> dict:
 
         # Create database connection using helper
         engine = build_merge_engine_from_env_template(
-            credential_secret_name='sqlserver-demo-merge',
-            credential_secret_type='USER_PASSWORD',
-            driver='mssql+pyodbc',
-            host='ds-scale-merge-06030935-f006.database.windows.net',
-            port=1433,
-            database='merge_db',
-            query_driver='ODBC Driver 18 for SQL Server'
+            credential_secret_name='snowflake-runtime',
+            credential_secret_type='PRIVATE_KEY_AUTH',
+            driver='snowflake',
+            host='HORSEQD-DATASURFACE_AZURE_SF',
+            port=None,
+            database='DATASURFACE_SCALE',
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
-            expected_user, expected_pwd = get_merge_env_names_template('sqlserver-demo-merge')
-            print(f"Missing Merge SQL credentials in environment variables: {expected_user}, {expected_pwd}")
-            return {}
+            expected_user, expected_pwd = get_merge_env_names_template('snowflake-runtime')
+            # Do NOT return {} here: an empty desired set makes sync_dag_lifecycle remove every
+            # dynamic DAG (drop to 1). Raise instead so the enclosing handler re-raises and the
+            # sync is skipped, preserving existing DAGs until creds reappear — same contract as a
+            # transient read failure. Only a successful read of 0 active rows legitimately yields {}.
+            raise RuntimeError(f"Missing Merge SQL credentials in environment variables: {expected_user}, {expected_pwd}")
 
         try:
             # Read from the PSP-specific DC reconcile table
             # dag_id is now the primary key for direct lookup
             # Shard filter ensures each DAG file only loads its assigned DAGs
-            dc_reconcile_table_name = 'scd4_psp_dc_reconcile_dags'
+            dc_reconcile_table_name = 'ds_ctl_azuresnowflake_psp.dc_reconcile_dags'
             rows = fetch_rows(engine, f"""
                 SELECT dag_id, config_json
                 FROM {dc_reconcile_table_name}
@@ -2776,8 +2902,11 @@ def load_dc_reconcile_configurations() -> dict:
         generated_dags.update(desired)
 
     except Exception as e:
+        # Re-raise (don't collapse to {}) so a transient read failure preserves existing DAGs
+        # instead of removing them. See fetch_rows / load_platform_configurations.
         print(f"Error loading DC reconcile configurations: {e}")
-        return {}
+        _logger.error(f"Error loading DC reconcile configurations: {e}")
+        raise
 
     return generated_dags
 
@@ -2857,33 +2986,31 @@ def create_factory_dags_from_database(silent: bool = False, **context):
         from sqlalchemy import create_engine, text
         from sqlalchemy.engine import URL
 
-        # Build database connection using secret_manager (reads from Kubernetes API)
-        try:
-            merge_db_user, merge_db_password = secret_manager.getUserPassword('sqlserver-demo-merge')
-        except Exception as e:
-            if is_task_execution:
-                raise Exception(f"Failed to get Merge SQL credentials: {e}")
-            else:
-                log_message(f"Missing Merge SQL credentials - factory DAGs will be created during task execution: {e}")
-                return "Factory DAG creation deferred to task execution"
-
-        merge_db_host = 'ds-scale-merge-06030935-f006.database.windows.net'
-        merge_db_port = 1433
-        merge_db_db_name = 'merge_db'
-        merge_db_query = 'ODBC Driver 18 for SQL Server'
+        merge_db_host = 'HORSEQD-DATASURFACE_AZURE_SF'
+        merge_db_port = None
+        merge_db_db_name = 'DATASURFACE_SCALE'
+        merge_db_query = '{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
 
         # Create database connection using helper function
-        engine = build_merge_engine_from_env_template(
-            credential_secret_name='sqlserver-demo-merge',
-            credential_secret_type='USER_PASSWORD',
-            driver='mssql+pyodbc',
-            host=merge_db_host,
-            port=merge_db_port,
-            database=merge_db_db_name,
-            query_driver=merge_db_query
-        )
+        try:
+            engine = build_merge_engine_from_env_template(
+                credential_secret_name='snowflake-runtime',
+                credential_secret_type='PRIVATE_KEY_AUTH',
+                driver='snowflake',
+                host=merge_db_host,
+                port=merge_db_port,
+                database=merge_db_db_name,
+                query_driver=merge_db_query
+            )
+        except Exception as e:
+            if is_task_execution:
+                raise Exception(f"Failed to build Merge SQL engine: {e}")
+            else:
+                log_message(f"Merge SQL engine unavailable - factory DAGs will be created during task execution: {e}")
+                return "Factory DAG creation deferred to task execution"
+
         if engine is None:
-            expected_user, expected_pwd = get_merge_env_names_template('sqlserver-demo-merge')
+            expected_user, expected_pwd = get_merge_env_names_template('snowflake-runtime')
             if is_task_execution:
                 raise Exception(f"Missing Merge SQL credentials in environment variables: {expected_user}, {expected_pwd}")
             else:
@@ -2894,7 +3021,7 @@ def create_factory_dags_from_database(silent: bool = False, **context):
             # Read factory DAG configurations - table created/populated by handleModelMerge
             # dag_id is now the primary key for direct lookup
             # Shard filter ensures each DAG file only loads its assigned factory DAGs
-            factory_table_name = 'scd4_psp_factory_dags'
+            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT dag_id, config_json
@@ -2955,8 +3082,10 @@ def create_factory_dags_from_database(silent: bool = False, **context):
         if is_task_execution:
             raise Exception(f"Factory & CQRS DAG creation failed: {str(e)}")
         else:
-            # During module import, don't raise - just log and continue
-            return f"Factory & CQRS DAG creation failed: {str(e)}"
+            # During scheduler discovery, re-raise so Airflow keeps the previously
+            # parsed dynamic DAGs instead of treating a failed merge-DB read as
+            # an empty desired set and deactivating everything.
+            raise
 
 # Create dynamic DAGs during module import
 # Use parsing context to determine execution mode:
@@ -2979,7 +3108,12 @@ if _is_discovery_mode:
         initial_factory_dags = create_factory_dags_from_database(silent=False)
         print(f"🚀 Factory & CQRS DAG creation during discovery: {initial_factory_dags}")
     except Exception as e:
+        # Re-raise so the DAG-file parse FAILS on a transient merge-DB read error. Airflow retains
+        # the previously-parsed DAGs rather than dropping to just the static factory DAG ("drop to 1").
+        # The fetch_rows retry rides out brief blips; this preserves DAGs if the read ultimately fails.
         print(f"Warning: Failed to load initial Factory & CQRS DAGs during discovery: {e}")
+        _logger.error(f"Failed to load initial Factory & CQRS DAGs during discovery: {e}")
+        raise
 else:
     # Task execution mode: SDK task runner is importing the file to run a specific task
     # OPTIMIZATION: Only create the single DAG needed instead of all dynamic DAGs
