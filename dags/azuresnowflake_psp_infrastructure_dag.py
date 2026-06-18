@@ -55,6 +55,10 @@ _silent_mode = False
 # When num_shards > 1, each DAG file only loads DAGs where dag_hash % num_shards == shard_number
 _num_shards = 1
 _shard_number = 0
+CONTROL_COL_DAG_ID = '"dag_id"'
+CONTROL_COL_DAG_HASH = '"dag_hash"'
+CONTROL_COL_CONFIG_JSON = '"config_json"'
+CONTROL_COL_STATUS = '"status"'
 
 # Airflow schedules queued tasks by priority_weight when pool/executor slots free up.
 # Keep system/factory control-plane DAGs ahead of high-volume data-plane DAGs.
@@ -65,7 +69,7 @@ SYSTEM_DAG_WEIGHT_RULE = 'absolute'
 def _get_shard_filter() -> str:
     """Return SQL WHERE clause fragment for shard filtering, or empty string if not sharded."""
     if _num_shards > 1:
-        return f" AND dag_hash % {_num_shards} = {_shard_number}"
+        return f" AND {CONTROL_COL_DAG_HASH} % {_num_shards} = {_shard_number}"
     return ""
 
 
@@ -588,6 +592,7 @@ model_merge_env_vars = [
     # Platform configuration (literal values)
     k8s.V1EnvVar(name='DATASURFACE_PSP_NAME', value='azuresnowflake-psp'),
     k8s.V1EnvVar(name='DATASURFACE_NAMESPACE', value='ds-scale-azure-sf'),
+    k8s.V1EnvVar(name='DATASURFACE_ESO_RECONCILE', value='false'),
 ]
 
 # Model merge needs only the merge database and model Git credentials.
@@ -614,7 +619,7 @@ merge_task = KubernetesPodOperator(
     task_id='infrastructure_merge_task',
     name='azuresnowflake-psp-infra-merge',
     namespace='ds-scale-azure-sf',
-    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.65',
+    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.65-azsf-fix1',
     cmds=['/bin/bash'],
     arguments=[
         '-c',
@@ -1587,8 +1592,8 @@ def _create_single_ingestion_dag(dag_id: str, platform: str) -> Optional[DAG]:
             factory_dag_id = f"{platform}_factory_dag"
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
-                    SELECT config_json FROM {factory_table_name}
-                    WHERE dag_id = :dag_id AND status = 'active'
+                    SELECT {CONTROL_COL_CONFIG_JSON} FROM {factory_table_name}
+                    WHERE {CONTROL_COL_DAG_ID} = :dag_id AND {CONTROL_COL_STATUS} = 'active'
                 """), {'dag_id': factory_dag_id})
                 factory_row = result.fetchone()
                 
@@ -1601,8 +1606,8 @@ def _create_single_ingestion_dag(dag_id: str, platform: str) -> Optional[DAG]:
             dag_table = platform_config['phys_dag_table_name']
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
-                    SELECT config_json FROM {dag_table}
-                    WHERE dag_id = :dag_id AND status = 'active'
+                    SELECT {CONTROL_COL_CONFIG_JSON} FROM {dag_table}
+                    WHERE {CONTROL_COL_DAG_ID} = :dag_id AND {CONTROL_COL_STATUS} = 'active'
                 """), {'dag_id': dag_id})
                 stream_row = result.fetchone()
                 
@@ -1639,8 +1644,8 @@ def _create_single_datatransformer_dag(dag_id: str, platform: str) -> Optional[D
             factory_dag_id = f"{platform}_datatransformer_factory"
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
-                    SELECT config_json FROM {factory_table_name}
-                    WHERE dag_id = :dag_id AND status = 'active'
+                    SELECT {CONTROL_COL_CONFIG_JSON} FROM {factory_table_name}
+                    WHERE {CONTROL_COL_DAG_ID} = :dag_id AND {CONTROL_COL_STATUS} = 'active'
                 """), {'dag_id': factory_dag_id})
                 factory_row = result.fetchone()
                 
@@ -1653,8 +1658,8 @@ def _create_single_datatransformer_dag(dag_id: str, platform: str) -> Optional[D
             dt_table = platform_config['phys_datatransformer_table_name']
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
-                    SELECT config_json FROM {dt_table}
-                    WHERE dag_id = :dag_id AND status = 'active'
+                    SELECT {CONTROL_COL_CONFIG_JSON} FROM {dt_table}
+                    WHERE {CONTROL_COL_DAG_ID} = :dag_id AND {CONTROL_COL_STATUS} = 'active'
                 """), {'dag_id': dag_id})
                 dt_row = result.fetchone()
                 
@@ -1690,8 +1695,8 @@ def _create_single_cqrs_dag(dag_id: str) -> Optional[DAG]:
             cqrs_table_name = 'ds_ctl_azuresnowflake_psp.cqrs_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
-                    SELECT config_json FROM {cqrs_table_name}
-                    WHERE dag_id = :dag_id AND status = 'active'
+                    SELECT {CONTROL_COL_CONFIG_JSON} FROM {cqrs_table_name}
+                    WHERE {CONTROL_COL_DAG_ID} = :dag_id AND {CONTROL_COL_STATUS} = 'active'
                 """), {'dag_id': dag_id})
                 row = result.fetchone()
 
@@ -1726,8 +1731,8 @@ def _create_single_factory_dag(dag_id: str) -> Optional[DAG]:
             factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
-                    SELECT config_json FROM {factory_table_name}
-                    WHERE dag_id = :dag_id AND status = 'active'
+                    SELECT {CONTROL_COL_CONFIG_JSON} FROM {factory_table_name}
+                    WHERE {CONTROL_COL_DAG_ID} = :dag_id AND {CONTROL_COL_STATUS} = 'active'
                 """), {'dag_id': dag_id})
                 row = result.fetchone()
                 
@@ -1762,8 +1767,8 @@ def _create_single_dt_factory_dag(dag_id: str) -> Optional[DAG]:
             factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
-                    SELECT config_json FROM {factory_table_name}
-                    WHERE dag_id = :dag_id AND status = 'active'
+                    SELECT {CONTROL_COL_CONFIG_JSON} FROM {factory_table_name}
+                    WHERE {CONTROL_COL_DAG_ID} = :dag_id AND {CONTROL_COL_STATUS} = 'active'
                 """), {'dag_id': dag_id})
                 row = result.fetchone()
                 
@@ -1881,9 +1886,9 @@ def load_platform_configurations(config: PlatformConfig):
             # Shard filter ensures each DAG file only loads its assigned DAGs
             table_name = config['phys_dag_table_name']
             rows = fetch_rows(engine, f"""
-                    SELECT dag_id, config_json
+                    SELECT {CONTROL_COL_DAG_ID}, {CONTROL_COL_CONFIG_JSON}
                     FROM {table_name}
-                    WHERE status = 'active'{_get_shard_filter()}
+                    WHERE {CONTROL_COL_STATUS} = 'active'{_get_shard_filter()}
                 """)
         finally:
             # Always dispose the engine to prevent connection pool leaks
@@ -2411,9 +2416,9 @@ def load_datatransformer_configurations(config: PlatformConfig):
             # Shard filter ensures each DAG file only loads its assigned DAGs
             table_name = config['phys_datatransformer_table_name']
             rows = fetch_rows(engine, f"""
-                    SELECT dag_id, config_json
+                    SELECT {CONTROL_COL_DAG_ID}, {CONTROL_COL_CONFIG_JSON}
                     FROM {table_name}
-                    WHERE status = 'active'{_get_shard_filter()}
+                    WHERE {CONTROL_COL_STATUS} = 'active'{_get_shard_filter()}
                 """)
         finally:
             # Always dispose the engine to prevent connection pool leaks
@@ -2821,9 +2826,9 @@ def load_cqrs_configurations() -> dict:
             # Shard filter ensures each DAG file only loads its assigned DAGs
             cqrs_table_name = 'ds_ctl_azuresnowflake_psp.cqrs_dags'
             rows = fetch_rows(engine, f"""
-                SELECT dag_id, config_json
+                SELECT {CONTROL_COL_DAG_ID}, {CONTROL_COL_CONFIG_JSON}
                 FROM {cqrs_table_name}
-                WHERE status = 'active'{_get_shard_filter()}
+                WHERE {CONTROL_COL_STATUS} = 'active'{_get_shard_filter()}
             """)
         finally:
             # Always dispose the engine to prevent connection pool leaks
@@ -2882,9 +2887,9 @@ def load_dc_reconcile_configurations() -> dict:
             # Shard filter ensures each DAG file only loads its assigned DAGs
             dc_reconcile_table_name = 'ds_ctl_azuresnowflake_psp.dc_reconcile_dags'
             rows = fetch_rows(engine, f"""
-                SELECT dag_id, config_json
+                SELECT {CONTROL_COL_DAG_ID}, {CONTROL_COL_CONFIG_JSON}
                 FROM {dc_reconcile_table_name}
-                WHERE status = 'active'{_get_shard_filter()}
+                WHERE {CONTROL_COL_STATUS} = 'active'{_get_shard_filter()}
             """)
         finally:
             # Always dispose the engine to prevent connection pool leaks
@@ -3024,9 +3029,9 @@ def create_factory_dags_from_database(silent: bool = False, **context):
             factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
-                    SELECT dag_id, config_json
+                    SELECT {CONTROL_COL_DAG_ID}, {CONTROL_COL_CONFIG_JSON}
                     FROM {factory_table_name}
-                    WHERE status = 'active'{_get_shard_filter()}
+                    WHERE {CONTROL_COL_STATUS} = 'active'{_get_shard_filter()}
                 """))
                 configs = result.fetchall()
         finally:
