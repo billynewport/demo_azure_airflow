@@ -619,7 +619,7 @@ merge_task = KubernetesPodOperator(
     task_id='infrastructure_merge_task',
     name='azuresnowflake-psp-infra-merge',
     namespace='ds-scale-azure-sf',
-    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.65-azsf-fix1',
+    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.65-azsf-fix2',
     cmds=['/bin/bash'],
     arguments=[
         '-c',
@@ -1581,14 +1581,14 @@ def _create_single_ingestion_dag(dag_id: str, platform: str) -> Optional[DAG]:
             host='HORSEQD-DATASURFACE_AZURE_SF',
             port=None,
             database='DATASURFACE_SCALE',
-            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW_MERGE", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
         
         try:
             # Query for the platform's factory config to get the ingestion table name
-            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
+            factory_table_name = 'YELLOW_MERGE.azuresnowflake_psp_factory_dags'
             factory_dag_id = f"{platform}_factory_dag"
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
@@ -1633,14 +1633,14 @@ def _create_single_datatransformer_dag(dag_id: str, platform: str) -> Optional[D
             host='HORSEQD-DATASURFACE_AZURE_SF',
             port=None,
             database='DATASURFACE_SCALE',
-            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW_MERGE", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
         
         try:
             # Query for the platform's factory config to get the datatransformer table name
-            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
+            factory_table_name = 'YELLOW_MERGE.azuresnowflake_psp_factory_dags'
             factory_dag_id = f"{platform}_datatransformer_factory"
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
@@ -1685,14 +1685,14 @@ def _create_single_cqrs_dag(dag_id: str) -> Optional[DAG]:
             host='HORSEQD-DATASURFACE_AZURE_SF',
             port=None,
             database='DATASURFACE_SCALE',
-            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW_MERGE", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
 
         try:
             # Direct lookup by dag_id (O(1) indexed lookup)
-            cqrs_table_name = 'ds_ctl_azuresnowflake_psp.cqrs_dags'
+            cqrs_table_name = 'YELLOW_MERGE.azuresnowflake_psp_cqrs_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT {CONTROL_COL_CONFIG_JSON} FROM {cqrs_table_name}
@@ -1722,13 +1722,13 @@ def _create_single_factory_dag(dag_id: str) -> Optional[DAG]:
             host='HORSEQD-DATASURFACE_AZURE_SF',
             port=None,
             database='DATASURFACE_SCALE',
-            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW_MERGE", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
         
         try:
-            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
+            factory_table_name = 'YELLOW_MERGE.azuresnowflake_psp_factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT {CONTROL_COL_CONFIG_JSON} FROM {factory_table_name}
@@ -1758,13 +1758,13 @@ def _create_single_dt_factory_dag(dag_id: str) -> Optional[DAG]:
             host='HORSEQD-DATASURFACE_AZURE_SF',
             port=None,
             database='DATASURFACE_SCALE',
-            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW_MERGE", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             return None
         
         try:
-            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
+            factory_table_name = 'YELLOW_MERGE.azuresnowflake_psp_factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT {CONTROL_COL_CONFIG_JSON} FROM {factory_table_name}
@@ -2810,7 +2810,7 @@ def load_cqrs_configurations() -> dict:
             host='HORSEQD-DATASURFACE_AZURE_SF',
             port=None,
             database='DATASURFACE_SCALE',
-            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW_MERGE", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             expected_user, expected_pwd = get_merge_env_names_template('snowflake-runtime')
@@ -2824,7 +2824,7 @@ def load_cqrs_configurations() -> dict:
             # Read from the PSP-specific CQRS table using template parameter
             # dag_id is now the primary key for direct lookup
             # Shard filter ensures each DAG file only loads its assigned DAGs
-            cqrs_table_name = 'ds_ctl_azuresnowflake_psp.cqrs_dags'
+            cqrs_table_name = 'YELLOW_MERGE.azuresnowflake_psp_cqrs_dags'
             rows = fetch_rows(engine, f"""
                 SELECT {CONTROL_COL_DAG_ID}, {CONTROL_COL_CONFIG_JSON}
                 FROM {cqrs_table_name}
@@ -2871,7 +2871,7 @@ def load_dc_reconcile_configurations() -> dict:
             host='HORSEQD-DATASURFACE_AZURE_SF',
             port=None,
             database='DATASURFACE_SCALE',
-            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
+            query_driver='{"warehouse": "DATASURFACE", "schema": "YELLOW_MERGE", "role": "DATASURFACE_RUNTIME_ROLE"}'
         )
         if engine is None:
             expected_user, expected_pwd = get_merge_env_names_template('snowflake-runtime')
@@ -2885,7 +2885,7 @@ def load_dc_reconcile_configurations() -> dict:
             # Read from the PSP-specific DC reconcile table
             # dag_id is now the primary key for direct lookup
             # Shard filter ensures each DAG file only loads its assigned DAGs
-            dc_reconcile_table_name = 'ds_ctl_azuresnowflake_psp.dc_reconcile_dags'
+            dc_reconcile_table_name = 'YELLOW_MERGE.azuresnowflake_psp_dc_reconcile_dags'
             rows = fetch_rows(engine, f"""
                 SELECT {CONTROL_COL_DAG_ID}, {CONTROL_COL_CONFIG_JSON}
                 FROM {dc_reconcile_table_name}
@@ -2994,7 +2994,7 @@ def create_factory_dags_from_database(silent: bool = False, **context):
         merge_db_host = 'HORSEQD-DATASURFACE_AZURE_SF'
         merge_db_port = None
         merge_db_db_name = 'DATASURFACE_SCALE'
-        merge_db_query = '{"warehouse": "DATASURFACE", "schema": "YELLOW", "role": "DATASURFACE_RUNTIME_ROLE"}'
+        merge_db_query = '{"warehouse": "DATASURFACE", "schema": "YELLOW_MERGE", "role": "DATASURFACE_RUNTIME_ROLE"}'
 
         # Create database connection using helper function
         try:
@@ -3026,7 +3026,7 @@ def create_factory_dags_from_database(silent: bool = False, **context):
             # Read factory DAG configurations - table created/populated by handleModelMerge
             # dag_id is now the primary key for direct lookup
             # Shard filter ensures each DAG file only loads its assigned factory DAGs
-            factory_table_name = 'ds_ctl_azuresnowflake_psp.factory_dags'
+            factory_table_name = 'YELLOW_MERGE.azuresnowflake_psp_factory_dags'
             with engine.begin() as connection:
                 result = connection.execute(text(f"""
                     SELECT {CONTROL_COL_DAG_ID}, {CONTROL_COL_CONFIG_JSON}
