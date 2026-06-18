@@ -619,7 +619,7 @@ merge_task = KubernetesPodOperator(
     task_id='infrastructure_merge_task',
     name='azuresnowflake-psp-infra-merge',
     namespace='ds-scale-azure-sf',
-    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.65-azsf-fix2',
+    image='registry.gitlab.com/datasurface-inc/datasurface/datasurface:v1.4.65-azsf-fix3',
     cmds=['/bin/bash'],
     arguments=[
         '-c',
